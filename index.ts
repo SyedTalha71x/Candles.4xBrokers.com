@@ -1,5 +1,4 @@
 import { Socket } from "net";
-import { WebSocket, WebSocketServer } from "ws";
 import pkg from "pg";
 const { Pool } = pkg;
 import Bull from "bull";
@@ -23,34 +22,7 @@ const PG_DATABASE = process.env.PG_DATABASE;
 
 const REDIS_HOST = process.env.REDIS_HOST || "localhost";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
-const WS_PORT = process.env.WS_PORT || 8080;
 
-let isShuttingDown = false;
-
-
-const redisClient = createClient({
-  url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
-});
-
-redisClient.on("error", (err) => {
-  console.error("Redis error:", err);
-});
-
-redisClient.on("connect", () => {
-  console.log("Connected to Redis");
-});
-
-(async () => {
-  await redisClient.connect();
-})();
-
-const wss = new WebSocketServer({
-  port: Number(WS_PORT) || 8080,
-});
-console.log(`WebSocket server is running on ws://18.215.154.174:${WS_PORT || 8080}`);
-
-// yeh line track kregi web socket clients ko or unki subscription ko
-const wsClients: Map<WebSocket, WebSocketClient> = new Map();
 
 if (
   !FIX_SERVER ||
@@ -65,48 +37,15 @@ if (
   );
 }
 
-const pgPool = new Pool({
-  host: PG_HOST,
-  port: PG_PORT ? Number(PG_PORT) : 5432,
-  user: PG_USER,
-  password: PG_PASSWORD,
-  database: PG_DATABASE,
-});
-
-let sequenceNumber = 0;
-let isConnected = false;
-let reconnectTimeout: NodeJS.Timeout | null = null;
-
 const timeFrames = {
   M1: 60000, // 1 minute (60000 ms)
   H1: 3600000, // 1 hour (3600000 ms)
   D1: 86400000, // 1 day (86400000 ms)
 };
 
-const MESSAGE_TYPES: Record<string, string> = {
-  "0": "Heartbeat",
-  "1": "Test Request",
-  "2": "Resend Request",
-  "3": "Reject",
-  "4": "Sequence Reset",
-  "5": "Logout",
-  A: "Logon",
-  V: "Market Data Request",
-  W: "Market Data Snapshot",
-  X: "Market Data Incremental Refresh",
-};
-
-const MD_ENTRY_TYPES: Record<string, string> = {
-  "0": "BID",
-  "1": "ASK",
-  "2": "TRADE",
-  "3": "INDEX_VALUE",
-  "4": "OPENING_PRICE",
-  "5": "CLOSING_PRICE",
-  "6": "SETTLEMENT_PRICE",
-  "7": "TRADING_SESSION_HIGH_PRICE",
-  "8": "TRADING_SESSION_LOW_PRICE",
-};
+let sequenceNumber = 0;
+let isConnected = false;
+let reconnectTimeout: NodeJS.Timeout | null = null;
 
 interface MarketDataMessage {
   symbol: string;
@@ -124,211 +63,7 @@ interface TickData {
   lots: number;
 }
 
-interface ParsedFixMessage {
-  messageType: string;
-  senderCompId: string;
-  targetCompId: string;
-  msgSeqNum: number;
-  sendingTime: string;
-  rawMessage: string;
-  testReqId?: string;
-  username?: string;
-  additionalFields: Record<string, string>;
-}
-
-interface CurrencyPairInfo {
-  currpair: string;
-  contractsize: number | null;
-}
-
-interface WebSocketClient {
-  currencyPairs: string[];
-  fsyms: string[];
-  tsyms: string[];
-}
-
-// WebSocket server event handlers
-wss.on("connection", async (ws) => {
-  console.log("New WebSocket client connected");
-
-  // Initializing the client data
-  const clientData: WebSocketClient = {
-    currencyPairs: [],
-    fsyms: [],
-    tsyms: [],
-  };
-
-  wsClients.set(ws, clientData);
-
-  // Handle client messages
-  ws.on("message", (message) => {
-    try {
-      const data = JSON.parse(message.toString());
-      console.log("WebSocket message received:", data);
-
-      if (data.action === "SubAdd") {
-        // Subscribe to currency pairs
-        if (data.subs && Array.isArray(data.subs)) {
-          data.subs.forEach((sub: string) => {
-            const fields = sub.split("~");
-            const fsym = fields[fields.length - 2];
-            const tsym = fields[fields.length - 1];
-            const currPair = fsym + tsym;
-
-            clientData.currencyPairs.push(currPair);
-            clientData.fsyms.push(fsym);
-            clientData.tsyms.push(tsym);
-          });
-
-          console.log(
-            `Client subscribed to: ${clientData.currencyPairs.join(", ")}`
-          );
-
-          // Send latest market data from Redis for the subscribed pairs
-          clientData.currencyPairs.forEach(async (pair) => {
-            const bidKey = `market:${pair}:BID`;
-            const askKey = `market:${pair}:ASK`;
-
-            const bidData = await redisClient.hGetAll(bidKey);
-            const askData = await redisClient.hGetAll(askKey);
-
-            if (bidData.price) {
-              const tickData = {
-                fsym: pair.slice(0, 3), // Assuming pair is like "EURUSD"
-                tsym: pair.slice(3),
-                p: parseFloat(bidData.price),
-                ts: Math.floor(new Date(bidData.timestamp).getTime() / 1000),
-                bora: "B",
-                lots: parseFloat(bidData.size),
-              };
-              ws.send(JSON.stringify(tickData));
-            }
-
-            if (askData.price) {
-              const tickData = {
-                fsym: pair.slice(0, 3),
-                tsym: pair.slice(3),
-                p: parseFloat(askData.price),
-                ts: Math.floor(new Date(askData.timestamp).getTime() / 1000),
-                bora: "A",
-                lots: parseFloat(askData.size),
-              };
-              ws.send(JSON.stringify(tickData));
-            }
-          });
-        }
-      } else if (data.action === "SubRemove") {
-        // Unsubscribe from currency pairs
-        if (data.subs && Array.isArray(data.subs)) {
-          data.subs.forEach((sub: string) => {
-            const fields = sub.split("~");
-            const fsym = fields[fields.length - 2];
-            const tsym = fields[fields.length - 1];
-            const currPair = fsym + tsym;
-
-            const index = clientData.currencyPairs.indexOf(currPair);
-            if (index !== -1) {
-              clientData.currencyPairs.splice(index, 1);
-              clientData.fsyms.splice(index, 1);
-              clientData.tsyms.splice(index, 1);
-            }
-          });
-
-          console.log(
-            `Client unsubscribed from pairs. Remaining subscriptions: ${clientData.currencyPairs.join(
-              ", "
-            )}`
-          );
-        }
-      }
-    } catch (error) {
-      console.error("Error processing WebSocket message:", error);
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("WebSocket client disconnected");
-    wsClients.delete(ws);
-  });
-
-  ws.on("error", (error) => {
-    console.error("WebSocket client error:", error);
-    wsClients.delete(ws);
-  });
-});
-
-const broadcastTickData = (
-  currencyPair: string,
-  price: number,
-  timestamp: Date,
-  lotSize: number,
-  type: "BID" | "ASK"
-) => {
-  const bora = type === "BID" ? "B" : "A";
-  const tickEpoch = Math.floor(timestamp.getTime() / 1000);
-
-  if (currencyPair === "DJIUSD") {
-    console.log(
-      `DJIUSD tick ${currencyPair} ${lotSize} ${bora} ${price} ${tickEpoch}`
-    );
-  }
-
-  wsClients.forEach((clientData, ws) => {
-    const index = clientData.currencyPairs.indexOf(currencyPair);
-
-    if (index !== -1) {
-      const fsym = clientData.fsyms[index];
-      const tsym = clientData.tsyms[index];
-
-      const tickData = {
-        fsym: fsym,
-        tsym: tsym,
-        p: price,
-        ts: tickEpoch,
-        bora: bora,
-        lots: lotSize,
-      };
-
-      const jsonData = JSON.stringify(tickData);
-      console.log(`Broadcasting to client: ${jsonData}`);
-
-      // Send to client if connection is open
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(jsonData);
-      }
-    }
-  });
-};
-
-const getUTCTimestamp = (): string => {
-  const now = new Date();
-  return `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(
-    2,
-    "0"
-  )}${String(now.getUTCDate()).padStart(2, "0")}-${String(
-    now.getUTCHours()
-  ).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}:${String(
-    now.getUTCSeconds()
-  ).padStart(2, "0")}.${String(now.getUTCMilliseconds()).padStart(3, "0")}`;
-};
-
-const calculateChecksum = (message: string): string => {
-  let sum = 0;
-  for (let i = 0; i < message.length; i++) {
-    sum += message.charCodeAt(i);
-  }
-  return (sum % 256).toString().padStart(3, "0");
-};
-
-const calculateLots = (quantity: number, contractSize: number): number => {
-  console.log(
-    `Calculating lots: ${quantity} / ${contractSize} = ${Math.round(
-      quantity / contractSize
-    )}`
-  );
-  return Math.round(quantity / contractSize);
-};
-
+// Create Bull queue for market data processing
 const marketDataQueue = new Bull("marketData", {
   redis: {
     host: REDIS_HOST,
@@ -352,6 +87,7 @@ const marketDataQueue = new Bull("marketData", {
   },
 });
 
+// Create Bull queue for candles processing
 const candleProcessingQueue = new Bull("candleProcessing", {
   redis: {
     host: REDIS_HOST,
@@ -371,6 +107,57 @@ const candleProcessingQueue = new Bull("candleProcessing", {
     duration: 1000,
   },
 });
+
+const MESSAGE_TYPES: Record<string, string> = {
+  "0": "Heartbeat",
+  "1": "Test Request",
+  "2": "Resend Request",
+  "3": "Reject",
+  "4": "Sequence Reset",
+  "5": "Logout",
+  A: "Logon",
+  V: "Market Data Request",
+  W: "Market Data Snapshot",
+  X: "Market Data Incremental Refresh",
+};
+
+// FIX tag meanings for market data
+const MD_ENTRY_TYPES: Record<string, string> = {
+  "0": "BID",
+  "1": "ASK",
+  "2": "TRADE",
+  "3": "INDEX_VALUE",
+  "4": "OPENING_PRICE",
+  "5": "CLOSING_PRICE",
+  "6": "SETTLEMENT_PRICE",
+  "7": "TRADING_SESSION_HIGH_PRICE",
+  "8": "TRADING_SESSION_LOW_PRICE",
+};
+
+interface ParsedFixMessage {
+  messageType: string;
+  senderCompId: string;
+  targetCompId: string;
+  msgSeqNum: number;
+  sendingTime: string;
+  rawMessage: string;
+  testReqId?: string;
+  username?: string;
+  additionalFields: Record<string, string>;
+}
+
+const pgPool = new Pool({
+  host: PG_HOST,
+  port: PG_PORT ? Number(PG_PORT) : 5432,
+  user: PG_USER,
+  password: PG_PASSWORD,
+  database: PG_DATABASE,
+});
+
+interface CurrencyPairInfo {
+  currpair: string;
+  contractsize: number | null;
+}
 
 // Store subscribable currency pairs
 let availableCurrencyPairs: CurrencyPairInfo[] = [];
@@ -520,6 +307,26 @@ const fetchAllCurrencyPairs = async () => {
   }
 };
 
+const getUTCTimestamp = (): string => {
+  const now = new Date();
+  return `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(
+    2,
+    "0"
+  )}${String(now.getUTCDate()).padStart(2, "0")}-${String(
+    now.getUTCHours()
+  ).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}:${String(
+    now.getUTCSeconds()
+  ).padStart(2, "0")}.${String(now.getUTCMilliseconds()).padStart(3, "0")}`;
+};
+
+const calculateChecksum = (message: string): string => {
+  let sum = 0;
+  for (let i = 0; i < message.length; i++) {
+    sum += message.charCodeAt(i);
+  }
+  return (sum % 256).toString().padStart(3, "0");
+};
+
 const createFixMessage = (
   body: Record<number | string, string | number>
 ): string => {
@@ -577,6 +384,7 @@ const ensureTableExists = async (
   }
 };
 
+// Set up Bull queue processor
 marketDataQueue.process(5, async (job) => {
   try {
     const data: MarketDataMessage = job.data;
@@ -623,6 +431,13 @@ marketDataQueue.process(5, async (job) => {
     console.log(`Executing query for ${tableName}:`, query.text);
     console.log(`Query values:`, query.values);
 
+    const payload = `${data.symbol}, ${lots}, ${
+      data.type === "BID" ? "B" : "A"
+    } ${data.price} ${ticktime}`;
+
+    // const query2 = `NOTIFY tick, '${payload}'`;
+
+    // await pgPool.query(query2);
     await pgPool.query(query);
     console.log(
       `✓ Successfully saved ${data.type} data for ${data.symbol} to database in ${tableName}`
@@ -842,6 +657,15 @@ const getContractSize = async (symbol: string): Promise<number> => {
   }
 };
 
+const calculateLots = (quantity: number, contractSize: number): number => {
+  console.log(
+    `Calculating lots: ${quantity} / ${contractSize} = ${Math.round(
+      quantity / contractSize
+    )}`
+  );
+  return Math.round(quantity / contractSize);
+};
+
 class FixClient {
   private client!: Socket;
   private reconnectAttempts: number = 0;
@@ -963,9 +787,12 @@ class FixClient {
     const parsed = this.parseFixMessage(logonMessage);
     console.log("Logon sent");
     this.logParsedMessage(parsed, "Sent");
+
+    // We'll wait for the logon response before subscribing
+    // The subscription will be triggered in handleData when we receive a logon response
   }
 
-  private async handleData(data: Buffer) {
+  private handleData(data: Buffer) {
     // Append the new data to our buffer
     this.buffer += data.toString();
 
@@ -978,6 +805,7 @@ class FixClient {
       const parsed = this.parseFixMessage(message);
       this.logParsedMessage(parsed, "Received");
 
+      // Process market data messages
       if (
         parsed.messageType === "Market Data Snapshot" ||
         parsed.messageType === "Market Data Incremental Refresh"
@@ -1069,7 +897,7 @@ class FixClient {
                     `Found ${type} entry for ${symbol}: Price=${price}, Size=${size}`
                   );
 
-                  // Create market data message
+                  // Create market data message and add to queue
                   const marketData: MarketDataMessage = {
                     symbol,
                     type: type as "BID" | "ASK",
@@ -1087,30 +915,13 @@ class FixClient {
                     },
                   };
 
-                  // Broadcast to WebSocket clients first
-                  broadcastTickData(
-                    symbol,
-                    price,
-                    new Date(),
-                    size,
-                    type as "BID" | "ASK"
-                  );
-
-                  const redisKey = `market:${symbol}:${type}`;
-                  await redisClient.hSet(redisKey, {
-                    price: price.toString(),
-                    size: size.toString(),
-                    timestamp: new Date().toISOString(),
-                  });
-
-                  console.log(`Stored ${type} data for ${symbol} in Redis`);
-
+                  console.log(`Adding to queue: ${JSON.stringify(marketData)}`);
                   marketDataQueue.add(marketData, {
                     jobId: `${symbol}_${type}_${Date.now()}`,
                   });
 
                   console.log(
-                    `Broadcasted first and added ${type} data for ${symbol} to queue: ${price}`
+                    `Added ${type} data for ${symbol} to queue: ${price}`
                   );
                 }
               }
@@ -1197,11 +1008,6 @@ class FixClient {
   }
 
   private reconnect() {
-    if (isShuttingDown) {
-      console.log("Shutdown in progress, not reconnecting");
-      return;
-  }
-  
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
@@ -1249,6 +1055,7 @@ class FixClient {
 
     console.log(`Found ${pairsToSubscribe.length} valid pairs to subscribe`);
 
+    // For each currency pair with valid contract size
     for (const pair of pairsToSubscribe) {
       console.log(
         `Subscribing to market data for ${pair.currpair} with contract size ${pair.contractsize}`
@@ -1257,6 +1064,7 @@ class FixClient {
       // Construct the FIX message manually to handle repeating groups correctly
       sequenceNumber++;
 
+      // Start with the basic message parts
       const messageBody = [
         "35=V", // Message Type (V = Market Data Request)
         `49=${SENDER_COMP_ID}`, // SenderCompID
@@ -1293,27 +1101,15 @@ class FixClient {
   }
 
   public disconnect() {
-    try {
-        if (isConnected) {
-            const logoutMessage = createFixMessage({
-                35: "5", // Logout
-            });
-            this.client.write(logoutMessage);
-            console.log("Logout message sent");
-            
-            // Give time for the message to be sent before ending
-            setTimeout(() => {
-                this.client.end();
-                console.log("Socket connection closed");
-            }, 500);
-        } else {
-            this.client.end();
-            console.log("Socket connection already closed");
-        }
-    } catch (error) {
-        console.error("Error during disconnect:", error);
+    if (isConnected) {
+      const logoutMessage = createFixMessage({
+        35: "5", // Logout
+      });
+      this.client.write(logoutMessage);
+      console.log("Logout message sent");
     }
-}
+    this.client.end();
+  }
 }
 
 const fixClient = new FixClient();
@@ -1321,35 +1117,15 @@ const fixClient = new FixClient();
 fixClient.connect();
 
 process.on("SIGINT", async () => {
-  if (isShuttingDown) return; // Prevent multiple executions
-  isShuttingDown = true;
-  
   console.log("Shutting down...");
-  
-  try {
-      // Disconnect from FIX server
-      fixClient.disconnect();
-      
-      // Close WebSocket server
-      console.log("Closing WebSocket server...");
-      await new Promise(resolve => wss.close(resolve));
-      
-      // Close Bull queues with longer timeout
-      console.log("Closing Bull queues...");
-      await Promise.all([
-          marketDataQueue.close(),
-          candleProcessingQueue.close()
-      ]);
-      
-      // Close database connection
-      console.log("Closing database connection...");
-      await pgPool.end();
-      console.log("Database connection closed");
-      
-      // Exit with success code
-      process.exit(0);
-  } catch (error) {
-      console.error("Error during shutdown:", error);
-      process.exit(1);
-  }
+  fixClient.disconnect();
+
+  console.log("Closing Bull queue...");
+  await marketDataQueue.close();
+  await candleProcessingQueue.close();
+
+  pgPool.end().then(() => {
+    console.log("Database connection closed");
+    process.exit(0);
+  });
 });
