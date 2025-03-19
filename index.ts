@@ -44,7 +44,7 @@ redisClient.on("connect", () => {
 const wss = new WebSocketServer({
   port: typeof WS_PORT === "string" ? parseInt(WS_PORT, 10) : WS_PORT || 8080,
 });
-console.log(`WebSocket server is running on ws://localhost:${WS_PORT || 8080}`);
+console.log(`WebSocket server is running on ws://18.215.154.174:${WS_PORT || 8080}`);
 
 // yeh line track kregi web socket clients ko or unki subscription ko
 const wsClients: Map<WebSocket, WebSocketClient> = new Map();

@@ -40,7 +40,7 @@
         }
         
         document.getElementById('connect').addEventListener('click', () => {
-            socket = new WebSocket(`ws://localhost:${WS_PORT || 8080}`);
+            socket = new WebSocket(`ws://18.215.154.174:${WS_PORT || 8080}`);
             
             socket.onopen = () => {
                 log('Connected to WebSocket server');
