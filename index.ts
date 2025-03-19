@@ -25,6 +25,9 @@ const REDIS_HOST = process.env.REDIS_HOST || "localhost";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
 const WS_PORT = process.env.WS_PORT || 8080;
 
+let isShuttingDown = false;
+
+
 const redisClient = createClient({
   url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
 });
@@ -42,7 +45,7 @@ redisClient.on("connect", () => {
 })();
 
 const wss = new WebSocketServer({
-  port: typeof WS_PORT === "string" ? parseInt(WS_PORT, 10) : WS_PORT || 8080,
+  port: Number(WS_PORT) || 8080,
 });
 console.log(`WebSocket server is running on ws://18.215.154.174:${WS_PORT || 8080}`);
 
@@ -1194,6 +1197,11 @@ class FixClient {
   }
 
   private reconnect() {
+    if (isShuttingDown) {
+      console.log("Shutdown in progress, not reconnecting");
+      return;
+  }
+  
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
@@ -1285,15 +1293,27 @@ class FixClient {
   }
 
   public disconnect() {
-    if (isConnected) {
-      const logoutMessage = createFixMessage({
-        35: "5", // Logout
-      });
-      this.client.write(logoutMessage);
-      console.log("Logout message sent");
+    try {
+        if (isConnected) {
+            const logoutMessage = createFixMessage({
+                35: "5", // Logout
+            });
+            this.client.write(logoutMessage);
+            console.log("Logout message sent");
+            
+            // Give time for the message to be sent before ending
+            setTimeout(() => {
+                this.client.end();
+                console.log("Socket connection closed");
+            }, 500);
+        } else {
+            this.client.end();
+            console.log("Socket connection already closed");
+        }
+    } catch (error) {
+        console.error("Error during disconnect:", error);
     }
-    this.client.end();
-  }
+}
 }
 
 const fixClient = new FixClient();
@@ -1301,18 +1321,35 @@ const fixClient = new FixClient();
 fixClient.connect();
 
 process.on("SIGINT", async () => {
+  if (isShuttingDown) return; // Prevent multiple executions
+  isShuttingDown = true;
+  
   console.log("Shutting down...");
-  fixClient.disconnect();
-
-  console.log("Closing WebSocket server...");
-  wss.close();
-
-  console.log("Closing Bull queue...");
-  await marketDataQueue.close();
-  await candleProcessingQueue.close();
-
-  pgPool.end().then(() => {
-    console.log("Database connection closed");
-    process.exit(0);
-  });
+  
+  try {
+      // Disconnect from FIX server
+      fixClient.disconnect();
+      
+      // Close WebSocket server
+      console.log("Closing WebSocket server...");
+      await new Promise(resolve => wss.close(resolve));
+      
+      // Close Bull queues with longer timeout
+      console.log("Closing Bull queues...");
+      await Promise.all([
+          marketDataQueue.close(),
+          candleProcessingQueue.close()
+      ]);
+      
+      // Close database connection
+      console.log("Closing database connection...");
+      await pgPool.end();
+      console.log("Database connection closed");
+      
+      // Exit with success code
+      process.exit(0);
+  } catch (error) {
+      console.error("Error during shutdown:", error);
+      process.exit(1);
+  }
 });
