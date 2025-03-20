@@ -3,7 +3,6 @@ import pkg from "pg";
 const { Pool } = pkg;
 import Bull from "bull";
 import { configDotenv } from "dotenv";
-import { createClient } from "redis";
 
 configDotenv();
 
