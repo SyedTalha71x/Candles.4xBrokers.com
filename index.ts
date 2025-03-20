@@ -22,7 +22,6 @@ const PG_DATABASE = process.env.PG_DATABASE;
 const REDIS_HOST = process.env.REDIS_HOST || "localhost";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
 
-
 if (
   !FIX_SERVER ||
   !FIX_PORT ||
@@ -202,6 +201,7 @@ export const ensureCandleTableExists = async (
     throw error;
   }
 };
+
 
 const initCandleTables = async () => {
   try {
@@ -430,26 +430,24 @@ marketDataQueue.process(5, async (job) => {
     console.log(`Executing query for ${tableName}:`, query.text);
     console.log(`Query values:`, query.values);
 
-    const payload = `${data.symbol}, ${lots}, ${
-      data.type === "BID" ? "B" : "A"
-    } ${data.price} ${ticktime}`;
+    const payload = `${data.symbol}, ${lots}, ${data.type === 'BID' ? 'B' : 'A'} ${data.price} ${ticktime}`;
 
-    // const query2 = `NOTIFY tick, '${payload}'`;
+    const query2 = `NOTIFY tick, '${payload}'`;
 
-    // await pgPool.query(query2);
+    await pgPool.query(query2);
     await pgPool.query(query);
     console.log(
       `✓ Successfully saved ${data.type} data for ${data.symbol} to database in ${tableName}`
     );
 
-    if (data.type === "BID") {
-      await processTickForCandles({
-        symbol: data.symbol,
-        price: data.price,
-        timestamp: ticktime,
-        lots: lots,
-      });
-    }
+    // if (data.type === "BID") {
+    //   await processTickForCandles({
+    //     symbol: data.symbol,
+    //     price: data.price,
+    //     timestamp: ticktime,
+    //     lots: lots,
+    //   });
+    // }
 
     return { success: true, symbol: data.symbol, type: data.type };
   } catch (error) {
@@ -472,22 +470,19 @@ candleProcessingQueue.process(async (job) => {
     throw new Error(`Invalid timestamp for ${symbol}`);
   }
 
-  console.log(
-    `Processing candle data for ${symbol} at ${timestamp.toISOString()}`
-  );
+  console.log(`Processing candle data for ${symbol} at ${timestamp.toISOString()}`);
 
   // Default timeFrames if not provided or invalid
   const defaultTimeFrames = {
-    M1: 60000, // 1 minute in milliseconds
-    H1: 3600000, // 1 hour in milliseconds
+    M1: 60000,    // 1 minute in milliseconds
+    H1: 3600000,  // 1 hour in milliseconds
     D1: 86400000, // 1 day in milliseconds
   };
 
   // Ensure timeFrames is an object with valid values
-  const resolvedTimeFrames =
-    typeof timeFrames === "object" && !Array.isArray(timeFrames)
-      ? timeFrames
-      : defaultTimeFrames;
+  const resolvedTimeFrames = typeof timeFrames === 'object' && !Array.isArray(timeFrames)
+    ? timeFrames
+    : defaultTimeFrames;
 
   // Log the resolved timeFrames for debugging
   console.log("Resolved timeFrames:", resolvedTimeFrames);
@@ -498,17 +493,15 @@ candleProcessingQueue.process(async (job) => {
       const timeframeDuration = resolvedTimeFrames[timeframe];
 
       // Ensure the timeframe duration is valid
-      if (typeof timeframeDuration !== "number" || isNaN(timeframeDuration)) {
-        console.error(
-          `Invalid duration for timeframe ${timeframe}:`,
-          timeframeDuration
-        );
+      if (typeof timeframeDuration !== 'number' || isNaN(timeframeDuration)) {
+        console.error(`Invalid duration for timeframe ${timeframe}:`, timeframeDuration);
         continue;
       }
 
       // Calculate the candle time (start time of the candle)
       const candleTimeMs =
-        Math.floor(timestamp.getTime() / timeframeDuration) * timeframeDuration;
+        Math.floor(timestamp.getTime() / timeframeDuration) *
+        timeframeDuration;
 
       // Log the calculated candleTimeMs for debugging
       console.log(`candleTimeMs for ${timeframe}:`, candleTimeMs);
@@ -517,9 +510,7 @@ candleProcessingQueue.process(async (job) => {
 
       // Check if the candleTime is valid
       if (isNaN(candleTime.getTime())) {
-        console.error(
-          `Invalid candleTime for ${symbol} and timeframe ${timeframe}`
-        );
+        console.error(`Invalid candleTime for ${symbol} and timeframe ${timeframe}`);
         continue;
       }
 
@@ -545,48 +536,48 @@ candleProcessingQueue.process(async (job) => {
         // Update existing candle
         const currentCandle = existingCandle.rows[0];
 
-        const updateQuery = {
-          text: `
-            UPDATE ${tableName}
-            SET high = GREATEST(high, $1),
-                low = LEAST(low, $2),
-                close = $3
-            WHERE candlesize = $4
-            AND lots = $5
-            AND candletime = $6
-          `,
-          values: [
-            price,
-            price,
-            price,
-            timeframe,
-            lots,
-            candleTime.toISOString(),
-          ],
-        };
+        // const updateQuery = {
+        //   text: `
+        //     UPDATE ${tableName}
+        //     SET high = GREATEST(high, $1),
+        //         low = LEAST(low, $2),
+        //         close = $3
+        //     WHERE candlesize = $4
+        //     AND lots = $5
+        //     AND candletime = $6
+        //   `,
+        //   values: [
+        //     price,
+        //     price,
+        //     price,
+        //     timeframe,
+        //     lots,
+        //     candleTime.toISOString(),
+        //   ],
+        // };
 
-        await pgPool.query(updateQuery);
-        console.log(`Updated ${timeframe} candle for ${symbol}`);
+        // await pgPool.query(updateQuery);
+        // console.log(`Updated ${timeframe} candle for ${symbol}`);
       } else {
-        const insertQuery = {
-          text: `
-            INSERT INTO ${tableName}
-            (candlesize, lots, candletime, open, high, low, close)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-          `,
-          values: [
-            timeframe,
-            lots,
-            candleTime.toISOString(),
-            price, // open
-            price, // high (same as open for new candle)
-            price, // low (same as open for new candle)
-            price, // close (same as open for new candle)
-          ],
-        };
+        // const insertQuery = {
+        //   text: `
+        //     INSERT INTO ${tableName}
+        //     (candlesize, lots, candletime, open, high, low, close)
+        //     VALUES ($1, $2, $3, $4, $5, $6, $7)
+        //   `,
+        //   values: [
+        //     timeframe,
+        //     lots,
+        //     candleTime.toISOString(),
+        //     price, // open
+        //     price, // high (same as open for new candle)
+        //     price, // low (same as open for new candle)
+        //     price, // close (same as open for new candle)
+        //   ],
+        // };
 
-        await pgPool.query(insertQuery);
-        console.log(`Created new ${timeframe} candle for ${symbol}`);
+        // await pgPool.query(insertQuery);
+        // console.log(`Created new ${timeframe} candle for ${symbol}`);
       }
     } catch (error) {
       console.error(
@@ -877,8 +868,7 @@ class FixClient {
             for (let i = 0; i < mdEntries.length; i++) {
               const entry = mdEntries[i];
               console.log(
-                `Entry ${i + 1} - Type: ${entry["269"]}, Price: ${
-                  entry["270"]
+                `Entry ${i + 1} - Type: ${entry["269"]}, Price: ${entry["270"]
                 }, Size: ${entry["271"]}`
               );
 
@@ -1094,7 +1084,7 @@ class FixClient {
       // Add a small delay between requests to prevent overwhelming the server
       if (pairsToSubscribe.indexOf(pair) < pairsToSubscribe.length - 1) {
         console.log("Waiting before sending next subscription...");
-        setTimeout(() => {}, 200);
+        setTimeout(() => { }, 200);
       }
     }
   }
