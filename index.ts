@@ -3,6 +3,8 @@ import pkg from "pg";
 const { Pool } = pkg;
 import Bull from "bull";
 import { configDotenv } from "dotenv";
+import WebSocket, { WebSocketServer } from "ws";
+import { createClient } from "redis";
 
 configDotenv();
 
@@ -35,11 +37,27 @@ if (
   );
 }
 
+
+const redisClient = createClient({
+  url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis Client Error:", err);
+});
+
+redisClient.connect().then(() => {
+  console.log("Connected to Redis");
+});
+
 const timeFrames = {
   M1: 60000, // 1 minute (60000 ms)
   H1: 3600000, // 1 hour (3600000 ms)
   D1: 86400000, // 1 day (86400000 ms)
 };
+
+const wss = new WebSocketServer({ port: 8080 });
+const wsClients = new Map();
 
 let sequenceNumber = 0;
 let isConnected = false;
@@ -61,7 +79,76 @@ interface TickData {
   lots: number;
 }
 
-// Create Bull queue for market data processing
+wss.on('connection', (ws) => {
+  console.log('New WebSocket client connected');
+  
+  const clientData = {
+    currencyPairs: new Set(), // Use a Set to avoid duplicates
+  };
+  wsClients.set(ws, clientData);
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      console.log('WebSocket message received:', data);
+
+      if (data.action === 'SubAdd' && data.subs && Array.isArray(data.subs)) {
+        // Subscribe to currency pairs
+        data.subs.forEach((sub) => {
+          const fields = sub.split('~');
+          const fsym = fields[fields.length - 2];
+          const tsym = fields[fields.length - 1];
+          const currPair = `${fsym}${tsym}`;
+          clientData.currencyPairs.add(currPair);
+        });
+        console.log(`Client subscribed to: ${[...clientData.currencyPairs].join(', ')}`);
+      } else if (data.action === 'SubRemove' && data.subs && Array.isArray(data.subs)) {
+        // Unsubscribe from currency pairs
+        data.subs.forEach((sub) => {
+          const fields = sub.split('~');
+          const fsym = fields[fields.length - 2];
+          const tsym = fields[fields.length - 1];
+          const currPair = `${fsym}${tsym}`;
+          clientData.currencyPairs.delete(currPair);
+        });
+        console.log(`Client unsubscribed from pairs. Remaining subscriptions: ${[...clientData.currencyPairs].join(', ')}`);
+      }
+    } catch (error) {
+      console.error('Error processing WebSocket message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket client disconnected');
+    wsClients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket client error:', error);
+    wsClients.delete(ws);
+  });
+});
+const broadcastMarketData = (marketData) => {
+  const { symbol, price, lots, type, timestamp } = marketData;
+  const [fsym, tsym] = [symbol.slice(0, 3), symbol.slice(3)]; 
+  const payload = {
+    currpair: symbol,
+    fsym,
+    tsym,
+    price,
+    lots,
+    bora: type === 'BID' ? 'B' : 'A', // B for Bid, A for Ask
+    ts: new Date(timestamp).getTime(), // Convert to epoch time
+  };
+
+  wsClients.forEach((clientData, ws) => {
+    if (clientData.currencyPairs.has(symbol)) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+      }
+    }
+  });
+};
 const marketDataQueue = new Bull("marketData", {
   redis: {
     host: REDIS_HOST,
@@ -84,8 +171,6 @@ const marketDataQueue = new Bull("marketData", {
     maxStalledCount: 1, // Prevent jobs from being marked as stalled too quickly
   },
 });
-
-// Create Bull queue for candles processing
 const candleProcessingQueue = new Bull("candleProcessing", {
   redis: {
     host: REDIS_HOST,
@@ -105,7 +190,6 @@ const candleProcessingQueue = new Bull("candleProcessing", {
     duration: 1000,
   },
 });
-
 const MESSAGE_TYPES: Record<string, string> = {
   "0": "Heartbeat",
   "1": "Test Request",
@@ -118,8 +202,6 @@ const MESSAGE_TYPES: Record<string, string> = {
   W: "Market Data Snapshot",
   X: "Market Data Incremental Refresh",
 };
-
-// FIX tag meanings for market data
 const MD_ENTRY_TYPES: Record<string, string> = {
   "0": "BID",
   "1": "ASK",
@@ -393,9 +475,7 @@ marketDataQueue.process(5, async (job) => {
     console.log(`Got contract size: ${contractSize} for ${data.symbol}`);
 
     const lots = calculateLots(data.quantity, contractSize);
-    console.log(
-      `Calculated lots: ${lots} (${data.quantity} / ${contractSize})`
-    );
+
 
     // Format time from data.timestamp
     let ticktime = new Date();
@@ -405,6 +485,23 @@ marketDataQueue.process(5, async (job) => {
       ticktime = new Date();
       ticktime.setHours(hours, minutes, seconds);
     }
+
+    const redisKey = `market:${data.symbol}:${data.type}`;
+    await redisClient.set(
+      redisKey,
+      JSON.stringify({
+        symbol: data.symbol,
+        type: data.type,
+        price: data.price,
+        lots: lots,
+        timestamp: ticktime.toISOString(),
+      }),
+      {
+        EX: 60 * 60, // Cache for 1 hour
+      }
+    );
+
+    console.log(`Cached market data in Redis with key: ${redisKey}`);
 
     // Determine which table to use based on the type
     let tableName: string;
@@ -427,27 +524,21 @@ marketDataQueue.process(5, async (job) => {
       values: [ticktime.toISOString(), lots, data.price],
     };
 
-    console.log(`Executing query for ${tableName}:`, query.text);
-    console.log(`Query values:`, query.values);
-
-    const payload = `${data.symbol}, ${lots}, ${data.type === 'BID' ? 'B' : 'A'} ${data.price} ${ticktime}`;
-
-    const query2 = `NOTIFY tick, '${payload}'`;
-
-    await pgPool.query(query2);
     await pgPool.query(query);
     console.log(
       `✓ Successfully saved ${data.type} data for ${data.symbol} to database in ${tableName}`
     );
 
-    // if (data.type === "BID") {
-    //   await processTickForCandles({
-    //     symbol: data.symbol,
-    //     price: data.price,
-    //     timestamp: ticktime,
-    //     lots: lots,
-    //   });
-    // }
+    if (data.type === "BID") {
+      await processTickForCandles({
+        symbol: data.symbol,
+        price: data.price,
+        timestamp: ticktime,
+        lots: lots,
+      });
+    }
+
+    broadcastMarketData(data)
 
     return { success: true, symbol: data.symbol, type: data.type };
   } catch (error) {
@@ -461,31 +552,23 @@ candleProcessingQueue.process(async (job) => {
 
   const lots = 1;
 
-  // Convert the timestamp string back to a Date object
   const timestamp = new Date(tickData.timestamp);
 
-  // Check if the timestamp is valid
   if (isNaN(timestamp.getTime())) {
     console.error(`Invalid timestamp for ${symbol}: ${tickData.timestamp}`);
     throw new Error(`Invalid timestamp for ${symbol}`);
   }
 
-  console.log(`Processing candle data for ${symbol} at ${timestamp.toISOString()}`);
-
-  // Default timeFrames if not provided or invalid
   const defaultTimeFrames = {
-    M1: 60000,    // 1 minute in milliseconds
-    H1: 3600000,  // 1 hour in milliseconds
-    D1: 86400000, // 1 day in milliseconds
+    M1: 60000,    
+    H1: 3600000,  
+    D1: 86400000,
   };
 
   // Ensure timeFrames is an object with valid values
   const resolvedTimeFrames = typeof timeFrames === 'object' && !Array.isArray(timeFrames)
     ? timeFrames
     : defaultTimeFrames;
-
-  // Log the resolved timeFrames for debugging
-  console.log("Resolved timeFrames:", resolvedTimeFrames);
 
   // For each timeframe (M1, H1, D1)
   for (const timeframe of Object.keys(resolvedTimeFrames)) {
@@ -503,9 +586,6 @@ candleProcessingQueue.process(async (job) => {
         Math.floor(timestamp.getTime() / timeframeDuration) *
         timeframeDuration;
 
-      // Log the calculated candleTimeMs for debugging
-      console.log(`candleTimeMs for ${timeframe}:`, candleTimeMs);
-
       const candleTime = new Date(candleTimeMs);
 
       // Check if the candleTime is valid
@@ -514,11 +594,27 @@ candleProcessingQueue.process(async (job) => {
         continue;
       }
 
-      console.log(
-        `Processing ${timeframe} candle for ${symbol} at ${candleTime.toISOString()}`
-      );
 
       const tableName = `candles_${symbol.toLowerCase()}_bid`;
+
+      const redisKey = `candle:${symbol}:${timeframe}:${candleTime.toISOString()}`;
+      await redisClient.set(
+        redisKey,
+        JSON.stringify({
+          symbol: symbol,
+          timeframe: timeframe,
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          timestamp: candleTime.toISOString(),
+        }),
+        {
+          EX: 60 * 60 * 24, // Cache for 1 day
+        }
+      );
+
+      console.log(`Cached candle data in Redis with key: ${redisKey}`);
 
       const existingCandleQuery = {
         text: `
@@ -536,48 +632,48 @@ candleProcessingQueue.process(async (job) => {
         // Update existing candle
         const currentCandle = existingCandle.rows[0];
 
-        // const updateQuery = {
-        //   text: `
-        //     UPDATE ${tableName}
-        //     SET high = GREATEST(high, $1),
-        //         low = LEAST(low, $2),
-        //         close = $3
-        //     WHERE candlesize = $4
-        //     AND lots = $5
-        //     AND candletime = $6
-        //   `,
-        //   values: [
-        //     price,
-        //     price,
-        //     price,
-        //     timeframe,
-        //     lots,
-        //     candleTime.toISOString(),
-        //   ],
-        // };
+        const updateQuery = {
+          text: `
+            UPDATE ${tableName}
+            SET high = GREATEST(high, $1),
+                low = LEAST(low, $2),
+                close = $3
+            WHERE candlesize = $4
+            AND lots = $5
+            AND candletime = $6
+          `,
+          values: [
+            price,
+            price,
+            price,
+            timeframe,
+            lots,
+            candleTime.toISOString(),
+          ],
+        };
 
-        // await pgPool.query(updateQuery);
-        // console.log(`Updated ${timeframe} candle for ${symbol}`);
+        await pgPool.query(updateQuery);
+        console.log(`Updated ${timeframe} candle for ${symbol}`);
       } else {
-        // const insertQuery = {
-        //   text: `
-        //     INSERT INTO ${tableName}
-        //     (candlesize, lots, candletime, open, high, low, close)
-        //     VALUES ($1, $2, $3, $4, $5, $6, $7)
-        //   `,
-        //   values: [
-        //     timeframe,
-        //     lots,
-        //     candleTime.toISOString(),
-        //     price, // open
-        //     price, // high (same as open for new candle)
-        //     price, // low (same as open for new candle)
-        //     price, // close (same as open for new candle)
-        //   ],
-        // };
+        const insertQuery = {
+          text: `
+            INSERT INTO ${tableName}
+            (candlesize, lots, candletime, open, high, low, close)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `,
+          values: [
+            timeframe,
+            lots,
+            candleTime.toISOString(),
+            price, // open
+            price, // high (same as open for new candle)
+            price, // low (same as open for new candle)
+            price, // close (same as open for new candle)
+          ],
+        };
 
-        // await pgPool.query(insertQuery);
-        // console.log(`Created new ${timeframe} candle for ${symbol}`);
+        await pgPool.query(insertQuery);
+        console.log(`Created new ${timeframe} candle for ${symbol}`);
       }
     } catch (error) {
       console.error(
@@ -1112,6 +1208,9 @@ process.on("SIGINT", async () => {
   console.log("Closing Bull queue...");
   await marketDataQueue.close();
   await candleProcessingQueue.close();
+
+  console.log("Closing Redis connection...");
+  await redisClient.quit();
 
   pgPool.end().then(() => {
     console.log("Database connection closed");
