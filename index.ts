@@ -471,11 +471,20 @@ marketDataQueue.process(5, async (job) => {
     const data: MarketDataMessage = job.data;
     console.log(`Processing market data job for ${data.symbol} (${data.type})`);
 
+    // Check if the data is too old (e.g., more than 5 minutes old)
+    const messageTimestamp = new Date(data.timestamp).getTime();
+    const currentTime = Date.now();
+    const dataAge = currentTime - messageTimestamp;
+    
+    if (dataAge > 5 * 60 * 1000) { // 5 minutes
+      console.log(`Skipping stale data for ${data.symbol} (${data.type}), age: ${dataAge}ms`);
+      return { success: false, reason: "stale_data", symbol: data.symbol, type: data.type };
+    }
+
     const contractSize = await getContractSize(data.symbol);
     console.log(`Got contract size: ${contractSize} for ${data.symbol}`);
 
     const lots = calculateLots(data.quantity, contractSize);
-
 
     // Format time from data.timestamp
     let ticktime = new Date();
@@ -854,28 +863,60 @@ class FixClient {
     console.log("=".repeat(80) + "\n");
   }
 
+  private async clearRedisCache(): Promise<void> {
+    try {
+      // Get all keys matching market:* and candle:* patterns
+      const marketKeys = await redisClient.keys('market:*');
+      const candleKeys = await redisClient.keys('candle:*');
+      
+      const allKeys = [...marketKeys, ...candleKeys];
+      
+      if (allKeys.length > 0) {
+        // Delete all cached keys
+        await redisClient.del(allKeys);
+        console.log(`Cleared ${allKeys.length} cached entries from Redis`);
+      } else {
+        console.log('No cached entries found to clear');
+      }
+      
+      return;
+    } catch (error) {
+      console.error('Error clearing Redis cache:', error);
+      throw error;
+    }
+  }
+
+  private resetSequenceNumber() {
+    sequenceNumber = 0;
+    console.log("Reset sequence number to 0");
+  }
+
   private handleConnect() {
     console.log("Connected to FIX server");
     isConnected = true;
     this.reconnectAttempts = 0;
     this.buffer = "";
-
-    const logonMessage = createFixMessage({
-      35: "A",
-      98: 0,
-      108: 30,
-      553: USERNAME || "",
-      554: PASSWORD || "",
-      141: "Y",
+  
+    // Clear Redis cache on reconnect to prevent using stale data
+    this.clearRedisCache().then(() => {
+      console.log("Redis cache cleared on reconnect");
+      
+      const logonMessage = createFixMessage({
+        35: "A",
+        98: 0,
+        108: 30,
+        553: USERNAME || "",
+        554: PASSWORD || "",
+        141: "Y",
+      });
+  
+      this.client.write(logonMessage);
+      const parsed = this.parseFixMessage(logonMessage);
+      console.log("Logon sent");
+      this.logParsedMessage(parsed, "Sent");
+    }).catch(err => {
+      console.error("Failed to clear Redis cache:", err);
     });
-
-    this.client.write(logonMessage);
-    const parsed = this.parseFixMessage(logonMessage);
-    console.log("Logon sent");
-    this.logParsedMessage(parsed, "Sent");
-
-    // We'll wait for the logon response before subscribing
-    // The subscription will be triggered in handleData when we receive a logon response
   }
 
   private handleData(data: Buffer) {
@@ -1096,13 +1137,18 @@ class FixClient {
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
-
+  
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.log(
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
-
+  
+      this.client.removeAllListeners();
+      this.client.destroy();
+      
+      this.initializeClient();
+  
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
@@ -1112,7 +1158,6 @@ class FixClient {
       );
     }
   }
-
   public connect() {
     try {
       console.log(`Connecting to FIX server at ${FIX_SERVER}:${FIX_PORT}...`);
