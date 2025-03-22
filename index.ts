@@ -221,14 +221,9 @@ const initCandleTables = async () => {
     const result = await pgPool.query("SELECT currpair FROM currpairdetails");
     const allCurrencyPairs = result.rows;
 
-    console.log(
-      `Initializing candle tables for ${allCurrencyPairs.length} currency pairs`
-    );
-
     for (const pair of allCurrencyPairs) {
       const tableName = `candles_${pair.currpair.toLowerCase()}_bid`;
       await ensureCandleTableExists(tableName);
-      console.log(`Candle table for ${pair.currpair} initialized`);
     }
   } catch (error) {
     console.error("Error initializing candle tables:", error);
@@ -247,9 +242,7 @@ const processTickForCandles = async (tickData: TickData) => {
         jobId: `candle_${tickData.symbol}_${Date.now()}`,
       }
     );
-    console.log(
-      `Added tick data for ${tickData.symbol} to candle processing queue`
-    );
+
   } catch (error) {
     console.error("Error adding tick to candle processing queue:", error);
   }
@@ -262,7 +255,6 @@ const initDatabase = async () => {
 
 
     await cacheCandlesAndTicks();
-    console.log("Database tables initialized successfully");
   } catch (error) {
     console.error("Error initializing database tables:", error);
   }
@@ -275,21 +267,11 @@ const fetchAllCurrencyPairs = async () => {
     );
     availableCurrencyPairs = result.rows;
 
-    console.log(
-      `Fetched ${availableCurrencyPairs.length} currency pairs from database`
-    );
-
-    // Filter out pairs with null contract size
     const validPairs = availableCurrencyPairs.filter(
       (pair) => pair.contractsize !== null
     );
     const invalidPairs = availableCurrencyPairs.filter(
       (pair) => pair.contractsize === null
-    );
-
-    console.log(`${validPairs.length} pairs have valid contract size`);
-    console.log(
-      `${invalidPairs.length} pairs have null contract size and will not be subscribed`
     );
 
     if (invalidPairs.length > 0) {
@@ -304,7 +286,6 @@ const fetchAllCurrencyPairs = async () => {
       subscribedPairs.add(pair.currpair);
     });
 
-    console.log("Subscribed pairs:", Array.from(subscribedPairs));
 
     for (const pair of validPairs) {
       await ensureTableExists(
@@ -380,7 +361,6 @@ const ensureTableExists = async (
     );
 
     if (!tableCheck.rows[0].exists) {
-      console.log(`Table ${tableName} does not exist, creating it...`);
 
       await pgPool.query(`
                 CREATE TABLE ${tableName} (
@@ -390,7 +370,6 @@ const ensureTableExists = async (
                 )
             `);
 
-      console.log(`Created table ${tableName}`);
     }
   } catch (error) {
     console.error(`Error ensuring table ${tableName} exists:`, error);
@@ -475,10 +454,6 @@ marketDataQueue.process(5, async (job) => {
     };
 
     await pgPool.query(query);
-    console.log(
-      `✓ Successfully saved ${data.type} data for ${data.symbol} to database in ${tableName}`
-    );
-
     if (data.type === "BID") {
       await processTickForCandles({
         symbol: data.symbol,
@@ -613,7 +588,6 @@ candleProcessingQueue.process(async (job) => {
         };
 
         await pgPool.query(updateQuery);
-        console.log(`Updated ${timeframe} candle for ${symbol}`);
       } else {
         const insertQuery = {
           text: `
@@ -633,7 +607,6 @@ candleProcessingQueue.process(async (job) => {
         };
 
         await pgPool.query(insertQuery);
-        console.log(`Created new ${timeframe} candle for ${symbol}`);
       }
     } catch (error) {
       console.error(
@@ -672,9 +645,7 @@ const getContractSize = async (symbol: string): Promise<number> => {
     if (pairInfo && pairInfo.contractsize !== null) {
       return parseFloat(pairInfo.contractsize.toString());
     } else {
-      console.warn(
-        `Warning: Received data for ${symbol} which has no contract size or wasn't subscribed`
-      );
+
 
       // Try to get the contract size directly from the database as a fallback
       try {
@@ -684,9 +655,7 @@ const getContractSize = async (symbol: string): Promise<number> => {
         );
 
         if (result.rows.length > 0 && result.rows[0].contractsize !== null) {
-          console.log(
-            `Found contract size in database: ${result.rows[0].contractsize} for ${symbol}`
-          );
+
           return parseFloat(result.rows[0].contractsize.toString());
         }
       } catch (dbError) {
@@ -704,11 +673,7 @@ const getContractSize = async (symbol: string): Promise<number> => {
 };
 
 const calculateLots = (quantity: number, contractSize: number): number => {
-  console.log(
-    `Calculating lots: ${quantity} / ${contractSize} = ${Math.round(
-      quantity / contractSize
-    )}`
-  );
+
   return Math.round(quantity / contractSize);
 };
 
@@ -851,7 +816,7 @@ class FixClient {
     const messages = this.extractMessages();
 
     for (const message of messages) {
-      console.log("RAW MESSAGE RECEIVED:", message);
+      // console.log("RAW MESSAGE RECEIVED:", message);
 
       const parsed = this.parseFixMessage(message);
       this.logParsedMessage(parsed, "Received");
@@ -868,15 +833,15 @@ class FixClient {
           const noMDEntries = parseInt(parsed.additionalFields["268"] || "0");
           const symbol = parsed.additionalFields["55"] || "";
 
-          console.log(
-            `Got market data for symbol: ${symbol}, entries: ${noMDEntries}`
-          );
+          // console.log(
+          //   `Got market data for symbol: ${symbol}, entries: ${noMDEntries}`
+          // );
 
           if (noMDEntries > 0 && symbol) {
             // Process all incoming data regardless of subscription status
-            console.log(
-              `Processing ${noMDEntries} market data entries for ${symbol}`
-            );
+            // console.log(
+            //   `Processing ${noMDEntries} market data entries for ${symbol}`
+            // );
 
             // Extract all fields directly from the raw message
             const rawFields = message.split("\u0001");
@@ -923,15 +888,15 @@ class FixClient {
               mdEntries.push(currentEntry);
             }
 
-            console.log(`Extracted ${mdEntries.length} market data entries`);
+            // console.log(`Extracted ${mdEntries.length} market data entries`);
 
             // Process each entry
             for (let i = 0; i < mdEntries.length; i++) {
               const entry = mdEntries[i];
-              console.log(
-                `Entry ${i + 1} - Type: ${entry["269"]}, Price: ${entry["270"]
-                }, Size: ${entry["271"]}`
-              );
+              // console.log(
+              //   `Entry ${i + 1} - Type: ${entry["269"]}, Price: ${entry["270"]
+              //   }, Size: ${entry["271"]}`
+              // );
 
               if (entry["269"] && entry["270"]) {
                 const entryType = entry["269"];
@@ -943,9 +908,9 @@ class FixClient {
                   // BID or ASK
                   const type = MD_ENTRY_TYPES[entryType];
 
-                  console.log(
-                    `Found ${type} entry for ${symbol}: Price=${price}, Size=${size}`
-                  );
+                  // console.log(
+                  //   `Found ${type} entry for ${symbol}: Price=${price}, Size=${size}`
+                  // );
 
                   // Create market data message and add to queue
                   const marketData: MarketDataMessage = {
@@ -965,14 +930,14 @@ class FixClient {
                     },
                   };
 
-                  console.log(`Adding to queue: ${JSON.stringify(marketData)}`);
+                  // console.log(`Adding to queue: ${JSON.stringify(marketData)}`);
                   marketDataQueue.add(marketData, {
                     jobId: `${symbol}_${type}_${Date.now()}`,
                   });
 
-                  console.log(
-                    `Added ${type} data for ${symbol} to queue: ${price}`
-                  );
+                  // console.log(
+                  //   `Added ${type} data for ${symbol} to queue: ${price}`
+                  // );
                 }
               }
             }
@@ -1112,14 +1077,13 @@ class FixClient {
       subscribedPairs.has(pair.currpair)
     );
 
-    console.log(`Found ${pairsToSubscribe.length} valid pairs to subscribe`);
+    // console.log(`Found ${pairsToSubscribe.length} valid pairs to subscribe`);
 
     for (const pair of pairsToSubscribe) {
-      console.log(
-        `Subscribing to market data for ${pair.currpair} with contract size ${pair.contractsize}`
-      );
+      // console.log(
+      //   `Subscribing to market data for ${pair.currpair} with contract size ${pair.contractsize}`
+      // );
 
-      // Construct the FIX message manually to handle repeating groups correctly
       sequenceNumber++;
 
       const uniqueId = uuidv4();
@@ -1149,11 +1113,11 @@ class FixClient {
 
       this.client.write(fullMessage);
 
-      console.log(`Sent market data subscription request for ${pair.currpair}`);
+      // console.log(`Sent market data subscription request for ${pair.currpair}`);
 
       // Add a small delay between requests to prevent overwhelming the server
       if (pairsToSubscribe.indexOf(pair) < pairsToSubscribe.length - 1) {
-        console.log("Waiting before sending next subscription...");
+        // console.log("Waiting before sending next subscription...");
         setTimeout(() => { }, 200);
       }
     }
