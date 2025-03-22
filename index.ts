@@ -6,8 +6,8 @@ import { configDotenv } from "dotenv";
 import { createClient } from "redis";
 import { v4 as uuidv4 } from 'uuid';
 
-
 configDotenv();
+
 
 const FIX_SERVER = process.env.FIX_SERVER;
 const FIX_PORT = process.env.FIX_PORT;
@@ -52,13 +52,11 @@ redisClient.connect().then(() => {
   console.error('Failed to connect to Redis:', err);
 });
 
-
 const timeFrames = {
   M1: 60000, 
   H1: 3600000,
   D1: 86400000, 
 };
-
 
 let sequenceNumber = 0;
 let isConnected = false;
@@ -79,6 +77,7 @@ interface TickData {
   timestamp: Date;
   lots: number;
 }
+
 
 const marketDataQueue = new Bull("marketData", {
   redis: {
