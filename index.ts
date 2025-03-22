@@ -448,6 +448,7 @@ marketDataQueue.process(5, async (job) => {
                 INSERT INTO ${tableName} 
                 (ticktime, lots, price)
                 VALUES ($1, $2, $3)
+                ON CONFLICT (lots) DO NOTHING;
             `,
       values: [ticktime.toISOString(), lots, data.price],
     };
