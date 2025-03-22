@@ -6,7 +6,6 @@ import { configDotenv } from "dotenv";
 import { createClient } from "redis";
 import { v4 as uuidv4 } from 'uuid';
 
-const uniqueId = uuidv4();
 
 configDotenv();
 
@@ -261,6 +260,8 @@ const initDatabase = async () => {
     await fetchAllCurrencyPairs();
     await initCandleTables();
 
+
+    await cacheCandlesAndTicks();
     console.log("Database tables initialized successfully");
   } catch (error) {
     console.error("Error initializing database tables:", error);
@@ -1121,6 +1122,7 @@ class FixClient {
       // Construct the FIX message manually to handle repeating groups correctly
       sequenceNumber++;
 
+      const uniqueId = uuidv4();
       const mdReqId = `MDR_${uniqueId}`;
 
       const messageBody = [
