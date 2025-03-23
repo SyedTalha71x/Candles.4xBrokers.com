@@ -391,14 +391,7 @@ async function addRedisRecord(redisKey, candleData, deleteExisting = false) {
       },
     ]);
     console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
-    console.log("Candle Data:", {
-      candleepoch: typeof candleData.candleepoch,
-      open: typeof candleData.open,
-      high: typeof candleData.high,
-      low: typeof candleData.low,
-      close: typeof candleData.close,
-    });
-    
+
   } catch (error) {
     console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
@@ -406,6 +399,8 @@ async function addRedisRecord(redisKey, candleData, deleteExisting = false) {
 
 async function processTickResolution(currpair, lots, price, tickepoch, resolution) {
   const redisKey = `${currpair}_${resolution}`;
+
+  console.log(`Processing tick for ${redisKey}:`, { tickepoch, price });
 
   let floor;
   switch (resolution) {
@@ -422,6 +417,8 @@ async function processTickResolution(currpair, lots, price, tickepoch, resolutio
     default:
       return;
   }
+
+  console.log(`Calculated floor for ${redisKey}:`, floor);
 
   // Check if a candle already exists for this timeframe
   const existingCandle = await redisClient.zRangeByScore(redisKey, floor, floor);
@@ -445,12 +442,10 @@ async function processTickResolution(currpair, lots, price, tickepoch, resolutio
     };
 
     await addRedisRecord(redisKey, newCandle);
-
-    
   }
 }
 
-async function processTick(tickData: any) {
+async function processTick(tickData) {
   const { currpair, lots, price, tickepoch } = tickData;
 
   const resolutions = ["M1", "H1", "D1"];
@@ -491,6 +486,8 @@ marketDataQueue.process(5, async (job) => {
     }
 
     await ensureTableExists(tableName, data.type);
+
+    console.log(`Calculated ticktime:`, ticktime);
 
     await processTick({
       currpair: data.symbol,
