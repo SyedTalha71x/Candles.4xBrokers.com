@@ -5,6 +5,13 @@ import Bull from "bull";
 import { configDotenv } from "dotenv";
 import { createClient } from "redis";
 import { v4 as uuidv4 } from "uuid";
+import express, {Request, Response} from 'express'
+
+const app = express();
+const PORT = 3001;
+
+app.use(express.json());
+
 
 configDotenv();
 
@@ -39,8 +46,14 @@ if (
 
 const redisClient = createClient({
   url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
+  socket: {
+    reconnectStrategy: (retries) => {
+      const delay = Math.min(retries * 50, 2000);
+      console.log(`Redis reconnecting, attempt ${retries}, next try in ${delay}ms`);
+      return delay;
+    }
+  }
 });
-
 redisClient.on("error", (err) => {
   console.error("Redis error:", err);
 });
@@ -49,10 +62,13 @@ redisClient
   .connect()
   .then(() => {
     console.log("Connected to Redis");
+    setupRedisHealthCheck(); 
   })
   .catch((err) => {
     console.error("Failed to connect to Redis:", err);
   });
+
+  
 
 const timeFrames = {
   M1: 60000,
@@ -78,6 +94,37 @@ interface TickData {
   price: number;
   timestamp: Date;
   lots: number;
+}
+
+function setupRedisHealthCheck() {
+  const HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
+  
+  setInterval(async () => {
+    try {
+      if (!redisClient.isOpen) {
+        console.log("Redis connection is down, attempting to reconnect...");
+        await redisClient.connect();
+        console.log("Redis connection restored");
+      } else {
+        // Perform a simple ping to verify the connection is actually working
+        await redisClient.ping();
+      }
+    } catch (error) {
+      console.error("Redis health check failed:", error);
+      
+      // If we get here, the connection is broken but isOpen might still be true
+      // Force a reconnection
+      try {
+        if (redisClient.isOpen) {
+          await redisClient.disconnect();
+        }
+        await redisClient.connect();
+        console.log("Redis connection restored after forced reconnection");
+      } catch (reconnectError) {
+        console.error("Failed to restore Redis connection:", reconnectError);
+      }
+    }
+  }, HEALTH_CHECK_INTERVAL);
 }
 
 const marketDataQueue = new Bull("marketData", {
@@ -371,37 +418,64 @@ const ensureTableExists = async (
 };
 
 async function addRedisRecord(redisKey: string, candleData: any, deleteExisting = false) {
-  try {
-    if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
-      throw new Error(`Invalid score: ${candleData.candleepoch}`);
-    }
+  const MAX_RETRIES = 3;
+  let retries = 0;
+  
+  while (retries < MAX_RETRIES) {
+    try {
+      if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
+        throw new Error(`Invalid score: ${candleData.candleepoch}`);
+      }
 
-    if (deleteExisting) {
+      // Ensure Redis is connected
+      if (!redisClient.isOpen) {
+        console.log("Redis not connected, attempting to reconnect...");
+        await redisClient.connect();
+      }
+
       const score = Number(candleData.candleepoch);
-      await redisClient.zRemRangeByScore(redisKey, score, score);
+
+      if (deleteExisting) {
+        await redisClient.zRemRangeByScore(redisKey, score, score);
+      }
+
+      const record = JSON.stringify({
+        time: candleData.candleepoch,
+        open: candleData.open,
+        high: candleData.high,
+        low: candleData.low,
+        close: candleData.close,
+      });
+
+      // Add the new record
+      await redisClient.zAdd(redisKey, [
+        {
+          score: score,
+          value: record,
+        },
+      ]);
+      
+      return; // Success, exit the function
+    } catch (error) {
+      retries++;
+      console.error(`Error adding/updating Redis record for ${redisKey} (attempt ${retries}/${MAX_RETRIES}):`, error);
+      
+      if (retries >= MAX_RETRIES) {
+        console.error(`Failed to add Redis record after ${MAX_RETRIES} attempts`);
+      } else {
+        // Wait before retrying (exponential backoff)
+        await new Promise(resolve => setTimeout(resolve, 500 * Math.pow(2, retries)));
+        
+        // Try to reconnect if needed
+        if (!redisClient.isOpen) {
+          try {
+            await redisClient.connect();
+          } catch (connError) {
+            console.error("Failed to reconnect to Redis:", connError);
+          }
+        }
+      }
     }
-
-    const score = Number(candleData.candleepoch);
-
-    const record = JSON.stringify({
-      time: candleData.candleepoch,
-      open: candleData.open,
-      high: candleData.high,
-      low: candleData.low,
-      close: candleData.close,
-    });
-
-    // Add the new record
-    await redisClient.zAdd(redisKey, [
-      {
-        score: score, // Score must be a number
-        value: record, // Value must be a string
-      },
-    ]);
-
-    // console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
-  } catch (error) {
-    console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
 }
 
@@ -670,7 +744,7 @@ candleProcessingQueue.process(async (job) => {
 });
 
 marketDataQueue.on("completed", (job, result) => {
-  console.log(`Job ${job.id} completed: ${result.symbol} ${result.type}`);
+  // console.log(`Job ${job.id} completed: ${result.symbol} ${result.type}`);
 });
 
 marketDataQueue.on("failed", (job, error) => {
@@ -678,7 +752,7 @@ marketDataQueue.on("failed", (job, error) => {
 });
 
 candleProcessingQueue.on("completed", (job, result) => {
-  console.log(`job ${job.id} completed: ${result.symbol}`);
+  // console.log(`job ${job.id} completed: ${result.symbol}`);
 });
 
 candleProcessingQueue.on("failed", (job, error) => {
@@ -851,7 +925,6 @@ class FixClient {
     console.log("Logon sent");
     this.logParsedMessage(parsed, "Sent");
 
-    this.startHeartbeat()
   }
 
   private handleData(data: Buffer) {
@@ -1047,17 +1120,6 @@ class FixClient {
     return messages;
   }
 
-  private startHeartbeat() {
-    setInterval(() => {
-      if (isConnected) {
-        const heartbeatMessage = createFixMessage({
-          35: "0", // Heartbeat
-        });
-        this.client.write(heartbeatMessage);
-        console.log("Sent Heartbeat to server");
-      }
-    }, 30000); // Send every 30 seconds
-  }
 
   private handleError(err: Error) {
     console.log("Socket error:", err.message);
@@ -1079,7 +1141,7 @@ class FixClient {
     this.reconnect();
   }
 
-  private reconnect() {
+  private async reconnect() {
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
@@ -1090,38 +1152,26 @@ class FixClient {
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
   
-      // Check if Redis client is connected before disconnecting
-      if (redisClient.isOpen) {
-        redisClient
-          .disconnect()
-          .then(() => {
-            console.log("Redis disconnected successfully");
-          })
-          .catch((err) => {
-            console.error("Error disconnecting Redis:", err);
-          });
-      } else {
-        console.log("Redis client is already disconnected");
-      }
-  
       // Reinitialize the FIX client
       this.client.removeAllListeners();
       this.client.destroy();
       this.initializeClient();
   
+      // Ensure Redis is connected
+      if (!redisClient.isOpen) {
+        try {
+          console.log("Reconnecting to Redis...");
+          await redisClient.connect();
+          console.log("Successfully reconnected to Redis");
+        } catch (err) {
+          console.error("Failed to reconnect to Redis:", err);
+          // Continue with reconnection attempt despite Redis failure
+        }
+      }
+  
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
-  
-      // Reconnect to Redis
-      redisClient
-        .connect()
-        .then(() => {
-          console.log("Reconnected to Redis");
-        })
-        .catch((err) => {
-          console.error("Failed to reconnect to Redis:", err);
-        });
     } else {
       console.log(
         `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`
