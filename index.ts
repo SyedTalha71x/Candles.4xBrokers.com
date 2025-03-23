@@ -526,6 +526,7 @@ marketDataQueue.process(5, async (job) => {
         lots: lots,
       });
     }
+    console.log(`Successfully inserted tick into ${tableName}`);
 
     return { success: true, symbol: data.symbol, type: data.type };
   } catch (error) {
@@ -632,7 +633,9 @@ candleProcessingQueue.process(async (job) => {
           ],
         };
 
+        
         await pgPool.query(updateQuery);
+        console.log(`Successfully updated candle in ${tableName}`);
       } else {
         const insertQuery = {
           text: `
@@ -652,6 +655,7 @@ candleProcessingQueue.process(async (job) => {
         };
 
         await pgPool.query(insertQuery);
+        console.log(`Successfully inserted candle in ${tableName}`);
       }
     } catch (error) {
       console.error(
@@ -1046,16 +1050,15 @@ class FixClient {
     if (isConnected) {
       isConnected = false;
     }
-
     this.reconnect();
   }
+  
 
   private handleClose(hadError: boolean) {
     console.log("Connection closed", hadError ? "due to error" : "normally");
     isConnected = false;
     this.reconnect();
   }
-
   private handleEnd() {
     console.log("Connection ended");
     isConnected = false;
@@ -1066,22 +1069,33 @@ class FixClient {
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
-
+  
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.log(
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
-
+  
+      // Properly disconnect Redis before reconnecting
+      redisClient
+        .disconnect()
+        .then(() => {
+          console.log("Redis disconnected successfully");
+        })
+        .catch((err) => {
+          console.error("Error disconnecting Redis:", err);
+        });
+  
+      // Reinitialize the FIX client
       this.client.removeAllListeners();
       this.client.destroy();
-
       this.initializeClient();
-
+  
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
-
+  
+      // Reconnect to Redis
       redisClient
         .connect()
         .then(() => {
