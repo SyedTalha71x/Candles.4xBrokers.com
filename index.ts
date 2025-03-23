@@ -370,14 +370,10 @@ const ensureTableExists = async (
   }
 };
 
-async function addRedisRecord(redisKey: any, candleData: any, deleteExisting = false) {
+async function addRedisRecord(redisKey, candleData, deleteExisting = false) {
   try {
     if (deleteExisting) {
-      await redisClient.zRemRangeByScore(
-        redisKey,
-        candleData.candleepoch,
-        candleData.candleepoch
-      );
+      await redisClient.zRemRangeByScore(redisKey, candleData.candleepoch, candleData.candleepoch);
     }
 
     const record = JSON.stringify({
@@ -388,25 +384,19 @@ async function addRedisRecord(redisKey: any, candleData: any, deleteExisting = f
       close: candleData.close,
     });
 
-    await redisClient.zAdd(redisKey, {
-      score: candleData.candleepoch,
-      value: record,
-    });
-    console.log(
-      `Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`
-    );
+    await redisClient.zAdd(redisKey, [
+      {
+        score: candleData.candleepoch, // Score must be a number
+        value: record, // Value must be a string
+      },
+    ]);
+    console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
   } catch (error) {
     console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
 }
 
-async function processTickResolution(
-  currpair: any,
-  lots: any,
-  price: any,
-  tickepoch: any,
-  resolution: any
-) {
+async function processTickResolution(currpair, lots, price, tickepoch, resolution) {
   const redisKey = `${currpair}_${resolution}`;
 
   let floor;
@@ -419,24 +409,17 @@ async function processTickResolution(
       break;
     case "D1":
       const date = new Date(tickepoch * 1000);
-      floor =
-        new Date(
-          date.getUTCFullYear(),
-          date.getUTCMonth(),
-          date.getUTCDate()
-        ).getTime() / 1000;
+      floor = new Date(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()).getTime() / 1000;
       break;
     default:
       return;
   }
 
-  const existingCandle = await redisClient.zRangeByScore(
-    redisKey,
-    floor,
-    floor
-  );
+  // Check if a candle already exists for this timeframe
+  const existingCandle = await redisClient.zRangeByScore(redisKey, floor, floor);
 
   if (existingCandle.length > 0) {
+    // Update existing candle
     const candle = JSON.parse(existingCandle[0]);
     candle.close = price;
     candle.high = Math.max(candle.high, price);
@@ -444,12 +427,13 @@ async function processTickResolution(
 
     await addRedisRecord(redisKey, candle, true);
   } else {
+    // Create new candle
     const newCandle = {
-      candleepoch: floor,
-      open: price,
-      high: price,
-      low: price,
-      close: price,
+      candleepoch: floor, // Ensure this is a number
+      open: price, // Ensure this is a number
+      high: price, // Ensure this is a number
+      low: price, // Ensure this is a number
+      close: price, // Ensure this is a number
     };
 
     await addRedisRecord(redisKey, newCandle);
