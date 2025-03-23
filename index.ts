@@ -637,7 +637,7 @@ marketDataQueue.process(5, async (job) => {
         lots: lots,
       });
     }
-    console.log(`Successfully inserted tick into ${tableName}`);
+    // console.log(`Successfully inserted tick into ${tableName}`);
 
     return { success: true, symbol: data.symbol, type: data.type };
   } catch (error) {
@@ -745,7 +745,7 @@ candleProcessingQueue.process(async (job) => {
         };
 
         await pgPool.query(updateQuery);
-        console.log(`Successfully updated candle in ${tableName}`);
+        // console.log(`Successfully updated candle in ${tableName}`);
       } else {
         const insertQuery = {
           text: `
@@ -765,7 +765,7 @@ candleProcessingQueue.process(async (job) => {
         };
 
         await pgPool.query(insertQuery);
-        console.log(`Successfully inserted candle in ${tableName}`);
+        // console.log(`Successfully inserted candle in ${tableName}`);
       }
     } catch (error) {
       console.error(
@@ -970,17 +970,17 @@ class FixClient {
     const messages = this.extractMessages();
 
     for (const message of messages) {
-      // console.log("RAW MESSAGE RECEIVED:", message);
+      console.log("RAW MESSAGE RECEIVED:", message);
 
       const parsed = this.parseFixMessage(message);
-      // this.logParsedMessage(parsed, "Received");
+      this.logParsedMessage(parsed, "Received");
 
       // Process market data messages
       if (
         parsed.messageType === "Market Data Snapshot" ||
         parsed.messageType === "Market Data Incremental Refresh"
       ) {
-        // console.log("Received market data response!");
+        console.log("Received market data response!");
 
         try {
           // Extract market data entries
