@@ -5,13 +5,6 @@ import Bull from "bull";
 import { configDotenv } from "dotenv";
 import { createClient } from "redis";
 import { v4 as uuidv4 } from "uuid";
-import express, {Request, Response} from 'express'
-
-const app = express();
-const PORT = 3001;
-
-app.use(express.json());
-
 
 configDotenv();
 
@@ -60,8 +53,6 @@ redisClient
   .catch((err) => {
     console.error("Failed to connect to Redis:", err);
   });
-
-  
 
 const timeFrames = {
   M1: 60000,
@@ -259,7 +250,6 @@ const initDatabase = async () => {
   try {
     await fetchAllCurrencyPairs();
     await initCandleTables();
-
   } catch (error) {
     console.error("Error initializing database tables:", error);
   }
@@ -379,9 +369,16 @@ const ensureTableExists = async (
   }
 };
 
-async function addRedisRecord(redisKey: string, candleData: any, deleteExisting = false) {
+async function addRedisRecord(
+  redisKey: string,
+  candleData: any,
+  deleteExisting = false
+) {
   try {
-    if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
+    if (
+      candleData.candleepoch === undefined ||
+      isNaN(Number(candleData.candleepoch))
+    ) {
       throw new Error(`Invalid score: ${candleData.candleepoch}`);
     }
 
@@ -414,7 +411,13 @@ async function addRedisRecord(redisKey: string, candleData: any, deleteExisting 
   }
 }
 
-async function processTickResolution(currpair: string, lots: number, price: number, tickepoch: number, resolution: string) {
+async function processTickResolution(
+  currpair: string,
+  lots: number,
+  price: number,
+  tickepoch: number,
+  resolution: string
+) {
   const redisKey = `${currpair}_${resolution}`;
 
   // console.log(`Processing tick for ${redisKey}:`, { tickepoch, price });
@@ -429,7 +432,12 @@ async function processTickResolution(currpair: string, lots: number, price: numb
       break;
     case "D1":
       const date = new Date(tickepoch * 1000);
-      floor = new Date(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()).getTime() / 1000;
+      floor =
+        new Date(
+          date.getUTCFullYear(),
+          date.getUTCMonth(),
+          date.getUTCDate()
+        ).getTime() / 1000;
       break;
     default:
       return;
@@ -441,7 +449,11 @@ async function processTickResolution(currpair: string, lots: number, price: numb
   const candleepoch = floor;
 
   // Check if a candle already exists for this timeframe
-  const existingCandle = await redisClient.zRangeByScore(redisKey, floor, floor);
+  const existingCandle = await redisClient.zRangeByScore(
+    redisKey,
+    floor,
+    floor
+  );
 
   if (existingCandle.length > 0) {
     // Update existing candle
@@ -474,7 +486,6 @@ async function processTick(tickData) {
     await processTickResolution(currpair, lots, price, tickepoch, resolution);
   }
 }
-
 
 marketDataQueue.process(5, async (job) => {
   try {
@@ -642,7 +653,6 @@ candleProcessingQueue.process(async (job) => {
           ],
         };
 
-        
         await pgPool.query(updateQuery);
         console.log(`Successfully updated candle in ${tableName}`);
       } else {
@@ -859,8 +869,6 @@ class FixClient {
     const parsed = this.parseFixMessage(logonMessage);
     console.log("Logon sent");
     this.logParsedMessage(parsed, "Sent");
-
-
   }
 
   private handleData(data: Buffer) {
@@ -1023,7 +1031,6 @@ class FixClient {
     }
   }
 
-  // Extract complete FIX messages from the buffer
   private extractMessages(): string[] {
     const messages: string[] = [];
     const delimiter = "\u000110=";
@@ -1056,7 +1063,6 @@ class FixClient {
     return messages;
   }
 
-
   private handleError(err: Error) {
     console.log("Socket error:", err.message);
     if (isConnected) {
@@ -1064,7 +1070,6 @@ class FixClient {
     }
     this.reconnect();
   }
-  
 
   private handleClose(hadError: boolean) {
     console.log("Connection closed", hadError ? "due to error" : "normally");
@@ -1081,13 +1086,13 @@ class FixClient {
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
-  
+
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.log(
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
-  
+
       // Check if Redis client is connected before disconnecting
       if (redisClient.isOpen) {
         redisClient
@@ -1101,16 +1106,16 @@ class FixClient {
       } else {
         console.log("Redis client is already disconnected");
       }
-  
+
       // Reinitialize the FIX client
       this.client.removeAllListeners();
       this.client.destroy();
       this.initializeClient();
-  
+
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
-  
+
       // Reconnect to Redis
       redisClient
         .connect()
