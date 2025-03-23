@@ -4,10 +4,9 @@ const { Pool } = pkg;
 import Bull from "bull";
 import { configDotenv } from "dotenv";
 import { createClient } from "redis";
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from "uuid";
 
 configDotenv();
-
 
 const FIX_SERVER = process.env.FIX_SERVER;
 const FIX_PORT = process.env.FIX_PORT;
@@ -39,23 +38,26 @@ if (
 }
 
 const redisClient = createClient({
-  url: `redis://${REDIS_HOST}:${REDIS_PORT}`
+  url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
 });
 
-redisClient.on('error', (err) => {
-  console.error('Redis error:', err);
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
 });
 
-redisClient.connect().then(() => {
-  console.log('Connected to Redis');
-}).catch((err) => {
-  console.error('Failed to connect to Redis:', err);
-});
+redisClient
+  .connect()
+  .then(() => {
+    console.log("Connected to Redis");
+  })
+  .catch((err) => {
+    console.error("Failed to connect to Redis:", err);
+  });
 
 const timeFrames = {
-  M1: 60000, 
+  M1: 60000,
   H1: 3600000,
-  D1: 86400000, 
+  D1: 86400000,
 };
 
 let sequenceNumber = 0;
@@ -77,7 +79,6 @@ interface TickData {
   timestamp: Date;
   lots: number;
 }
-
 
 const marketDataQueue = new Bull("marketData", {
   redis: {
@@ -214,7 +215,6 @@ export const ensureCandleTableExists = async (
   }
 };
 
-
 const initCandleTables = async () => {
   try {
     const result = await pgPool.query("SELECT currpair FROM currpairdetails");
@@ -241,7 +241,6 @@ const processTickForCandles = async (tickData: TickData) => {
         jobId: `candle_${tickData.symbol}_${Date.now()}`,
       }
     );
-
   } catch (error) {
     console.error("Error adding tick to candle processing queue:", error);
   }
@@ -252,8 +251,6 @@ const initDatabase = async () => {
     await fetchAllCurrencyPairs();
     await initCandleTables();
 
-
-    await cacheCandlesAndTicks();
   } catch (error) {
     console.error("Error initializing database tables:", error);
   }
@@ -284,7 +281,6 @@ const fetchAllCurrencyPairs = async () => {
     validPairs.forEach((pair) => {
       subscribedPairs.add(pair.currpair);
     });
-
 
     for (const pair of validPairs) {
       await ensureTableExists(
@@ -360,7 +356,6 @@ const ensureTableExists = async (
     );
 
     if (!tableCheck.rows[0].exists) {
-
       await pgPool.query(`
                 CREATE TABLE ${tableName} (
                     ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -368,7 +363,6 @@ const ensureTableExists = async (
                     price NUMERIC NOT NULL
                 )
             `);
-
     }
   } catch (error) {
     console.error(`Error ensuring table ${tableName} exists:`, error);
@@ -376,32 +370,102 @@ const ensureTableExists = async (
   }
 };
 
-const cacheCandlesAndTicks = async () => {
+async function addRedisRecord(redisKey: any, candleData: any, deleteExisting = false) {
   try {
-    const result = await pgPool.query("SELECT currpair FROM currpairdetails");
-    const allCurrencyPairs = result.rows;
-
-    for (const pair of allCurrencyPairs) {
-      const symbol = pair.currpair.toLowerCase();
-      const bidTableName = `ticks_${symbol}_bid`;
-      const askTableName = `ticks_${symbol}_ask`;
-      const candleTableName = `candles_${symbol}_bid`;
-
-      const bidTicks = await pgPool.query(`SELECT * FROM ${bidTableName}`);
-      const askTicks = await pgPool.query(`SELECT * FROM ${askTableName}`);
-
-      await redisClient.set(`ticks_${symbol}_bid`, JSON.stringify(bidTicks.rows));
-      await redisClient.set(`ticks_${symbol}_ask`, JSON.stringify(askTicks.rows));
-
-      const candles = await pgPool.query(`SELECT * FROM ${candleTableName}`);
-      await redisClient.set(`candles_${symbol}`, JSON.stringify(candles.rows));
-
-      console.log(`Cached data for ${symbol}`);
+    if (deleteExisting) {
+      await redisClient.zRemRangeByScore(
+        redisKey,
+        candleData.candleepoch,
+        candleData.candleepoch
+      );
     }
+
+    const record = JSON.stringify({
+      time: candleData.candleepoch,
+      open: candleData.open,
+      high: candleData.high,
+      low: candleData.low,
+      close: candleData.close,
+    });
+
+    await redisClient.zAdd(redisKey, {
+      score: candleData.candleepoch,
+      value: record,
+    });
+    console.log(
+      `Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`
+    );
   } catch (error) {
-    console.error("Error caching data:", error);
+    console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
-};
+}
+
+async function processTickResolution(
+  currpair: any,
+  lots: any,
+  price: any,
+  tickepoch: any,
+  resolution: any
+) {
+  const redisKey = `${currpair}_${resolution}`;
+
+  let floor;
+  switch (resolution) {
+    case "M1":
+      floor = Math.floor(tickepoch / 60) * 60;
+      break;
+    case "H1":
+      floor = Math.floor(tickepoch / 3600) * 3600;
+      break;
+    case "D1":
+      const date = new Date(tickepoch * 1000);
+      floor =
+        new Date(
+          date.getUTCFullYear(),
+          date.getUTCMonth(),
+          date.getUTCDate()
+        ).getTime() / 1000;
+      break;
+    default:
+      return;
+  }
+
+  const existingCandle = await redisClient.zRangeByScore(
+    redisKey,
+    floor,
+    floor
+  );
+
+  if (existingCandle.length > 0) {
+    const candle = JSON.parse(existingCandle[0]);
+    candle.close = price;
+    candle.high = Math.max(candle.high, price);
+    candle.low = Math.min(candle.low, price);
+
+    await addRedisRecord(redisKey, candle, true);
+  } else {
+    const newCandle = {
+      candleepoch: floor,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+    };
+
+    await addRedisRecord(redisKey, newCandle);
+  }
+}
+
+async function processTick(tickData: any) {
+  const { currpair, lots, price, tickepoch } = tickData;
+
+  const resolutions = ["M1", "H1", "D1"];
+
+  for (const resolution of resolutions) {
+    await processTickResolution(currpair, lots, price, tickepoch, resolution);
+  }
+}
+
 
 marketDataQueue.process(5, async (job) => {
   try {
@@ -422,7 +486,6 @@ marketDataQueue.process(5, async (job) => {
       ticktime.setHours(hours, minutes, seconds);
     }
 
-
     // Determine which table to use based on the type
     let tableName: string;
     const symbolLower = data.symbol.toLowerCase();
@@ -435,13 +498,12 @@ marketDataQueue.process(5, async (job) => {
 
     await ensureTableExists(tableName, data.type);
 
-    const tickData = {
-      ticktime: ticktime.toISOString(),
+    await processTick({
+      currpair: data.symbol,
       lots: lots,
       price: data.price,
-    };
-
-    await redisClient.rPush(`ticks_${symbolLower}_${data.type.toLowerCase()}`, JSON.stringify(tickData));
+      tickepoch: Math.floor(ticktime.getTime() / 1000),
+    });
 
     const query = {
       text: `
@@ -483,15 +545,16 @@ candleProcessingQueue.process(async (job) => {
   }
 
   const defaultTimeFrames = {
-    M1: 60000,    
-    H1: 3600000,  
+    M1: 60000,
+    H1: 3600000,
     D1: 86400000,
   };
 
   // Ensure timeFrames is an object with valid values
-  const resolvedTimeFrames = typeof timeFrames === 'object' && !Array.isArray(timeFrames)
-    ? timeFrames
-    : defaultTimeFrames;
+  const resolvedTimeFrames =
+    typeof timeFrames === "object" && !Array.isArray(timeFrames)
+      ? timeFrames
+      : defaultTimeFrames;
 
   // For each timeframe (M1, H1, D1)
   for (const timeframe of Object.keys(resolvedTimeFrames)) {
@@ -499,57 +562,37 @@ candleProcessingQueue.process(async (job) => {
       const timeframeDuration = resolvedTimeFrames[timeframe];
 
       // Ensure the timeframe duration is valid
-      if (typeof timeframeDuration !== 'number' || isNaN(timeframeDuration)) {
-        console.error(`Invalid duration for timeframe ${timeframe}:`, timeframeDuration);
+      if (typeof timeframeDuration !== "number" || isNaN(timeframeDuration)) {
+        console.error(
+          `Invalid duration for timeframe ${timeframe}:`,
+          timeframeDuration
+        );
         continue;
       }
 
       // Calculate the candle time (start time of the candle)
       const candleTimeMs =
-        Math.floor(timestamp.getTime() / timeframeDuration) *
-        timeframeDuration;
+        Math.floor(timestamp.getTime() / timeframeDuration) * timeframeDuration;
 
       const candleTime = new Date(candleTimeMs);
 
       if (isNaN(candleTime.getTime())) {
-        console.error(`Invalid candleTime for ${symbol} and timeframe ${timeframe}`);
+        console.error(
+          `Invalid candleTime for ${symbol} and timeframe ${timeframe}`
+        );
         continue;
       }
 
-
       const tableName = `candles_${symbol.toLowerCase()}_bid`;
 
-      const redisCandle = await redisClient.get(`candle_${symbol}_${timeframe}_${candleTime.toISOString()}`);
+      const tickepoch = Math.floor(timestamp.getTime() / 1000);
 
-      if (redisCandle) {
-        const currentCandle = JSON.parse(redisCandle);
-
-        const updatedCandle = {
-          ...currentCandle,
-          high: Math.max(currentCandle.high, price),
-          low: Math.min(currentCandle.low, price),
-          close: price,
-        };
-
-        await redisClient.set(`candle_${symbol}_${timeframe}_${candleTime.toISOString()}`, JSON.stringify(updatedCandle));
-
-        console.log(`Updated ${timeframe} candle for ${symbol} in Redis`);
-      } else {
-        const newCandle = {
-          candlesize: timeframe,
-          lots: lots,
-          candletime: candleTime.toISOString(),
-          open: price,
-          high: price,
-          low: price,
-          close: price,
-        };
-
-        await redisClient.set(`candle_${symbol}_${timeframe}_${candleTime.toISOString()}`, JSON.stringify(newCandle));
-
-        console.log(`Created new ${timeframe} candle for ${symbol} in Redis`);
-      }
-
+      await processTick({
+        currpair: symbol,
+        lots: 1,
+        price: price,
+        tickepoch: tickepoch,
+      });
 
       const existingCandleQuery = {
         text: `
@@ -645,8 +688,6 @@ const getContractSize = async (symbol: string): Promise<number> => {
     if (pairInfo && pairInfo.contractsize !== null) {
       return parseFloat(pairInfo.contractsize.toString());
     } else {
-
-
       // Try to get the contract size directly from the database as a fallback
       try {
         const result = await pgPool.query(
@@ -655,7 +696,6 @@ const getContractSize = async (symbol: string): Promise<number> => {
         );
 
         if (result.rows.length > 0 && result.rows[0].contractsize !== null) {
-
           return parseFloat(result.rows[0].contractsize.toString());
         }
       } catch (dbError) {
@@ -673,7 +713,6 @@ const getContractSize = async (symbol: string): Promise<number> => {
 };
 
 const calculateLots = (quantity: number, contractSize: number): number => {
-
   return Math.round(quantity / contractSize);
 };
 
@@ -779,7 +818,6 @@ class FixClient {
     console.log("=".repeat(80) + "\n");
   }
 
-
   private resetSequenceNumber() {
     sequenceNumber = 0;
     console.log("Reset sequence number to 0");
@@ -790,22 +828,22 @@ class FixClient {
     isConnected = true;
     this.reconnectAttempts = 0;
     this.buffer = "";
-  
-      console.log("Redis cache cleared on reconnect");
-      
-      const logonMessage = createFixMessage({
-        35: "A",
-        98: 0,
-        108: 30,
-        553: USERNAME || "",
-        554: PASSWORD || "",
-        141: "Y",
-      });
-  
-      this.client.write(logonMessage);
-      const parsed = this.parseFixMessage(logonMessage);
-      console.log("Logon sent");
-      this.logParsedMessage(parsed, "Sent");
+
+    console.log("Redis cache cleared on reconnect");
+
+    const logonMessage = createFixMessage({
+      35: "A",
+      98: 0,
+      108: 30,
+      553: USERNAME || "",
+      554: PASSWORD || "",
+      141: "Y",
+    });
+
+    this.client.write(logonMessage);
+    const parsed = this.parseFixMessage(logonMessage);
+    console.log("Logon sent");
+    this.logParsedMessage(parsed, "Sent");
   }
 
   private handleData(data: Buffer) {
@@ -1026,34 +1064,37 @@ class FixClient {
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
-  
+
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.log(
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
-  
+
       this.client.removeAllListeners();
       this.client.destroy();
-  
+
       this.initializeClient();
-  
+
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
-  
-      redisClient.connect().then(() => {
-        console.log('Reconnected to Redis');
-      }).catch((err) => {
-        console.error('Failed to reconnect to Redis:', err);
-      });
+
+      redisClient
+        .connect()
+        .then(() => {
+          console.log("Reconnected to Redis");
+        })
+        .catch((err) => {
+          console.error("Failed to reconnect to Redis:", err);
+        });
     } else {
       console.log(
         `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`
       );
     }
   }
-  
+
   public connect() {
     try {
       console.log(`Connecting to FIX server at ${FIX_SERVER}:${FIX_PORT}...`);
@@ -1071,7 +1112,6 @@ class FixClient {
       );
       return;
     }
-
 
     const pairsToSubscribe = availableCurrencyPairs.filter((pair) =>
       subscribedPairs.has(pair.currpair)
@@ -1118,7 +1158,7 @@ class FixClient {
       // Add a small delay between requests to prevent overwhelming the server
       if (pairsToSubscribe.indexOf(pair) < pairsToSubscribe.length - 1) {
         // console.log("Waiting before sending next subscription...");
-        setTimeout(() => { }, 200);
+        setTimeout(() => {}, 200);
       }
     }
   }
