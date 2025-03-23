@@ -5,6 +5,15 @@ import Bull from "bull";
 import { configDotenv } from "dotenv";
 import { createClient } from "redis";
 import { v4 as uuidv4 } from "uuid";
+import express from "express";
+import type { Request, Response } from "express";
+import { RedisCommandArgument } from "@redis/client/dist/lib/commands/index.js";
+import { ZRangeByScoreOptions } from "@redis/client/dist/lib/commands/ZRANGEBYSCORE.js";
+
+const app = express();
+const PORT = 3000; 
+
+app.use(express.json());
 
 configDotenv();
 
@@ -72,6 +81,8 @@ let sequenceNumber = 0;
 let isConnected = false;
 let reconnectTimeout: NodeJS.Timeout | null = null;
 
+
+
 interface MarketDataMessage {
   symbol: string;
   type: "BID" | "ASK";
@@ -88,8 +99,49 @@ interface TickData {
   lots: number;
 }
 
+app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { symbol, resolution, startDate, endDate } = req.query;
+
+    if (!symbol || !resolution || !startDate || !endDate) {
+      res.status(400).json({ success: false, message: "Missing required query parameters." });
+      return;
+    }
+
+    const startTimestamp = Math.floor(new Date(startDate as string).getTime() / 1000);
+    const endTimestamp = Math.floor(new Date(endDate as string).getTime() / 1000);
+
+    if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
+      res.status(400).json({ success: false, message: "Invalid date format. Use ISO format." });
+      return;
+    }
+
+    const redisKey = `${symbol}_${resolution}`;
+    const candleData = await redisClient.zRangeByScore(
+      redisKey as RedisCommandArgument, 
+      startTimestamp.toString(), 
+      endTimestamp.toString(), 
+      { WITHSCORES: true } as ZRangeByScoreOptions
+    );
+
+    const parsedCandles = candleData
+      .map((value, index) => (index % 2 === 0 ? JSON.parse(value) : null))
+      .filter((value) => value !== null);
+
+    res.status(200).json({ success: true, data: parsedCandles });
+  } catch (error) {
+    console.error("Error fetching candle data:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch candle data" });
+  }
+});
+
+app.listen(PORT, '0.0.0.0', ()=>{
+  console.log(`Server is running ${PORT}`);
+})
+
+
 function setupRedisHealthCheck() {
-  const HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
+  const HEALTH_CHECK_INTERVAL = 30000;
   
   setInterval(async () => {
     try {
