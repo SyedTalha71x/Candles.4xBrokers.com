@@ -370,12 +370,26 @@ const ensureTableExists = async (
   }
 };
 
-async function addRedisRecord(redisKey, candleData, deleteExisting = false) {
+async function addRedisRecord(redisKey: string, candleData: any, deleteExisting = false) {
   try {
     if (deleteExisting) {
-      await redisClient.zRemRangeByScore(redisKey, candleData.candleepoch, candleData.candleepoch);
+      // Ensure the score is a number
+      const score = Number(candleData.candleepoch);
+      if (isNaN(score)) {
+        throw new Error(`Invalid score: ${candleData.candleepoch}`);
+      }
+
+      // Delete existing records with the same score
+      await redisClient.zRemRangeByScore(redisKey, score, score);
     }
 
+    // Ensure the score is a number
+    const score = Number(candleData.candleepoch);
+    if (isNaN(score)) {
+      throw new Error(`Invalid score: ${candleData.candleepoch}`);
+    }
+
+    // Ensure the value is a string
     const record = JSON.stringify({
       time: candleData.candleepoch,
       open: candleData.open,
@@ -384,14 +398,15 @@ async function addRedisRecord(redisKey, candleData, deleteExisting = false) {
       close: candleData.close,
     });
 
+    // Add the new record
     await redisClient.zAdd(redisKey, [
       {
-        score: candleData.candleepoch, // Score must be a number
+        score: score, // Score must be a number
         value: record, // Value must be a string
       },
     ]);
-    console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
 
+    console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
   } catch (error) {
     console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
