@@ -391,6 +391,14 @@ async function addRedisRecord(redisKey, candleData, deleteExisting = false) {
       },
     ]);
     console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
+    console.log("Candle Data:", {
+      candleepoch: typeof candleData.candleepoch,
+      open: typeof candleData.open,
+      high: typeof candleData.high,
+      low: typeof candleData.low,
+      close: typeof candleData.close,
+    });
+    
   } catch (error) {
     console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
@@ -437,6 +445,8 @@ async function processTickResolution(currpair, lots, price, tickepoch, resolutio
     };
 
     await addRedisRecord(redisKey, newCandle);
+
+    
   }
 }
 
