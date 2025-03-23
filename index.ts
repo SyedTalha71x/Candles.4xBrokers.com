@@ -372,22 +372,19 @@ const ensureTableExists = async (
 
 async function addRedisRecord(redisKey: string, candleData: any, deleteExisting = false) {
   try {
+    // Validate candleepoch
+    if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
+      throw new Error(`Invalid score: ${candleData.candleepoch}`);
+    }
+
     if (deleteExisting) {
       // Ensure the score is a number
       const score = Number(candleData.candleepoch);
-      if (isNaN(score)) {
-        throw new Error(`Invalid score: ${candleData.candleepoch}`);
-      }
-
-      // Delete existing records with the same score
       await redisClient.zRemRangeByScore(redisKey, score, score);
     }
 
     // Ensure the score is a number
     const score = Number(candleData.candleepoch);
-    if (isNaN(score)) {
-      throw new Error(`Invalid score: ${candleData.candleepoch}`);
-    }
 
     // Ensure the value is a string
     const record = JSON.stringify({
@@ -412,7 +409,7 @@ async function addRedisRecord(redisKey: string, candleData: any, deleteExisting 
   }
 }
 
-async function processTickResolution(currpair, lots, price, tickepoch, resolution) {
+async function processTickResolution(currpair: string, lots: number, price: number, tickepoch: number, resolution: string) {
   const redisKey = `${currpair}_${resolution}`;
 
   console.log(`Processing tick for ${redisKey}:`, { tickepoch, price });
@@ -435,6 +432,9 @@ async function processTickResolution(currpair, lots, price, tickepoch, resolutio
 
   console.log(`Calculated floor for ${redisKey}:`, floor);
 
+  // Ensure candleepoch is defined
+  const candleepoch = floor;
+
   // Check if a candle already exists for this timeframe
   const existingCandle = await redisClient.zRangeByScore(redisKey, floor, floor);
 
@@ -445,11 +445,11 @@ async function processTickResolution(currpair, lots, price, tickepoch, resolutio
     candle.high = Math.max(candle.high, price);
     candle.low = Math.min(candle.low, price);
 
-    await addRedisRecord(redisKey, candle, true);
+    await addRedisRecord(redisKey, { candleepoch, ...candle }, true);
   } else {
     // Create new candle
     const newCandle = {
-      candleepoch: floor, // Ensure this is a number
+      candleepoch, // Ensure this is a number
       open: price, // Ensure this is a number
       high: price, // Ensure this is a number
       low: price, // Ensure this is a number
