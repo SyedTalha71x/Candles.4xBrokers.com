@@ -372,21 +372,17 @@ const ensureTableExists = async (
 
 async function addRedisRecord(redisKey: string, candleData: any, deleteExisting = false) {
   try {
-    // Validate candleepoch
     if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
       throw new Error(`Invalid score: ${candleData.candleepoch}`);
     }
 
     if (deleteExisting) {
-      // Ensure the score is a number
       const score = Number(candleData.candleepoch);
       await redisClient.zRemRangeByScore(redisKey, score, score);
     }
 
-    // Ensure the score is a number
     const score = Number(candleData.candleepoch);
 
-    // Ensure the value is a string
     const record = JSON.stringify({
       time: candleData.candleepoch,
       open: candleData.open,
@@ -403,7 +399,7 @@ async function addRedisRecord(redisKey: string, candleData: any, deleteExisting 
       },
     ]);
 
-    console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
+    // console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
   } catch (error) {
     console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
@@ -412,7 +408,7 @@ async function addRedisRecord(redisKey: string, candleData: any, deleteExisting 
 async function processTickResolution(currpair: string, lots: number, price: number, tickepoch: number, resolution: string) {
   const redisKey = `${currpair}_${resolution}`;
 
-  console.log(`Processing tick for ${redisKey}:`, { tickepoch, price });
+  // console.log(`Processing tick for ${redisKey}:`, { tickepoch, price });
 
   let floor;
   switch (resolution) {
@@ -430,7 +426,7 @@ async function processTickResolution(currpair: string, lots: number, price: numb
       return;
   }
 
-  console.log(`Calculated floor for ${redisKey}:`, floor);
+  // console.log(`Calculated floor for ${redisKey}:`, floor);
 
   // Ensure candleepoch is defined
   const candleepoch = floor;
@@ -474,10 +470,10 @@ async function processTick(tickData) {
 marketDataQueue.process(5, async (job) => {
   try {
     const data: MarketDataMessage = job.data;
-    console.log(`Processing market data job for ${data.symbol} (${data.type})`);
+    // console.log(`Processing market data job for ${data.symbol} (${data.type})`);
 
     const contractSize = await getContractSize(data.symbol);
-    console.log(`Got contract size: ${contractSize} for ${data.symbol}`);
+    // console.log(`Got contract size: ${contractSize} for ${data.symbol}`);
 
     const lots = calculateLots(data.quantity, contractSize);
 
@@ -502,7 +498,7 @@ marketDataQueue.process(5, async (job) => {
 
     await ensureTableExists(tableName, data.type);
 
-    console.log(`Calculated ticktime:`, ticktime);
+    // console.log(`Calculated ticktime:`, ticktime);
 
     await processTick({
       currpair: data.symbol,
@@ -863,14 +859,14 @@ class FixClient {
       // console.log("RAW MESSAGE RECEIVED:", message);
 
       const parsed = this.parseFixMessage(message);
-      this.logParsedMessage(parsed, "Received");
+      // this.logParsedMessage(parsed, "Received");
 
       // Process market data messages
       if (
         parsed.messageType === "Market Data Snapshot" ||
         parsed.messageType === "Market Data Incremental Refresh"
       ) {
-        console.log("Received market data response!");
+        // console.log("Received market data response!");
 
         try {
           // Extract market data entries
