@@ -62,7 +62,6 @@ redisClient
   .connect()
   .then(() => {
     console.log("Connected to Redis");
-    setupRedisHealthCheck(); 
   })
   .catch((err) => {
     console.error("Failed to connect to Redis:", err);
@@ -94,37 +93,6 @@ interface TickData {
   price: number;
   timestamp: Date;
   lots: number;
-}
-
-function setupRedisHealthCheck() {
-  const HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
-  
-  setInterval(async () => {
-    try {
-      if (!redisClient.isOpen) {
-        console.log("Redis connection is down, attempting to reconnect...");
-        await redisClient.connect();
-        console.log("Redis connection restored");
-      } else {
-        // Perform a simple ping to verify the connection is actually working
-        await redisClient.ping();
-      }
-    } catch (error) {
-      console.error("Redis health check failed:", error);
-      
-      // If we get here, the connection is broken but isOpen might still be true
-      // Force a reconnection
-      try {
-        if (redisClient.isOpen) {
-          await redisClient.disconnect();
-        }
-        await redisClient.connect();
-        console.log("Redis connection restored after forced reconnection");
-      } catch (reconnectError) {
-        console.error("Failed to restore Redis connection:", reconnectError);
-      }
-    }
-  }, HEALTH_CHECK_INTERVAL);
 }
 
 const marketDataQueue = new Bull("marketData", {
@@ -418,64 +386,37 @@ const ensureTableExists = async (
 };
 
 async function addRedisRecord(redisKey: string, candleData: any, deleteExisting = false) {
-  const MAX_RETRIES = 3;
-  let retries = 0;
-  
-  while (retries < MAX_RETRIES) {
-    try {
-      if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
-        throw new Error(`Invalid score: ${candleData.candleepoch}`);
-      }
-
-      // Ensure Redis is connected
-      if (!redisClient.isOpen) {
-        console.log("Redis not connected, attempting to reconnect...");
-        await redisClient.connect();
-      }
-
-      const score = Number(candleData.candleepoch);
-
-      if (deleteExisting) {
-        await redisClient.zRemRangeByScore(redisKey, score, score);
-      }
-
-      const record = JSON.stringify({
-        time: candleData.candleepoch,
-        open: candleData.open,
-        high: candleData.high,
-        low: candleData.low,
-        close: candleData.close,
-      });
-
-      // Add the new record
-      await redisClient.zAdd(redisKey, [
-        {
-          score: score,
-          value: record,
-        },
-      ]);
-      
-      return; // Success, exit the function
-    } catch (error) {
-      retries++;
-      console.error(`Error adding/updating Redis record for ${redisKey} (attempt ${retries}/${MAX_RETRIES}):`, error);
-      
-      if (retries >= MAX_RETRIES) {
-        console.error(`Failed to add Redis record after ${MAX_RETRIES} attempts`);
-      } else {
-        // Wait before retrying (exponential backoff)
-        await new Promise(resolve => setTimeout(resolve, 500 * Math.pow(2, retries)));
-        
-        // Try to reconnect if needed
-        if (!redisClient.isOpen) {
-          try {
-            await redisClient.connect();
-          } catch (connError) {
-            console.error("Failed to reconnect to Redis:", connError);
-          }
-        }
-      }
+  try {
+    if (candleData.candleepoch === undefined || isNaN(Number(candleData.candleepoch))) {
+      throw new Error(`Invalid score: ${candleData.candleepoch}`);
     }
+
+    if (deleteExisting) {
+      const score = Number(candleData.candleepoch);
+      await redisClient.zRemRangeByScore(redisKey, score, score);
+    }
+
+    const score = Number(candleData.candleepoch);
+
+    const record = JSON.stringify({
+      time: candleData.candleepoch,
+      open: candleData.open,
+      high: candleData.high,
+      low: candleData.low,
+      close: candleData.close,
+    });
+
+    // Add the new record
+    await redisClient.zAdd(redisKey, [
+      {
+        score: score, // Score must be a number
+        value: record, // Value must be a string
+      },
+    ]);
+
+    // console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
+  } catch (error) {
+    console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
   }
 }
 
