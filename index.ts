@@ -39,6 +39,13 @@ if (
 
 const redisClient = createClient({
   url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
+  socket: {
+    reconnectStrategy: (retries) => {
+      const delay = Math.min(retries * 50, 2000);
+      console.log(`Redis reconnecting, attempt ${retries}, next try in ${delay}ms`);
+      return delay;
+    }
+  }
 });
 
 redisClient.on("error", (err) => {
@@ -49,6 +56,7 @@ redisClient
   .connect()
   .then(() => {
     console.log("Connected to Redis");
+    setupRedisHealthCheck();
   })
   .catch((err) => {
     console.error("Failed to connect to Redis:", err);
@@ -78,6 +86,37 @@ interface TickData {
   price: number;
   timestamp: Date;
   lots: number;
+}
+
+function setupRedisHealthCheck() {
+  const HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
+  
+  setInterval(async () => {
+    try {
+      if (!redisClient.isOpen) {
+        console.log("Redis connection is down, attempting to reconnect...");
+        await redisClient.connect();
+        console.log("Redis connection restored");
+      } else {
+        // Perform a simple ping to verify the connection is actually working
+        await redisClient.ping();
+      }
+    } catch (error) {
+      console.error("Redis health check failed:", error);
+      
+      // If we get here, the connection is broken but isOpen might still be true
+      // Force a reconnection
+      try {
+        if (redisClient.isOpen) {
+          await redisClient.disconnect();
+        }
+        await redisClient.connect();
+        console.log("Redis connection restored after forced reconnection");
+      } catch (reconnectError) {
+        console.error("Failed to restore Redis connection:", reconnectError);
+      }
+    }
+  }, HEALTH_CHECK_INTERVAL);
 }
 
 const marketDataQueue = new Bull("marketData", {
@@ -1082,49 +1121,37 @@ class FixClient {
     this.reconnect();
   }
 
-  private reconnect() {
+  private async reconnect() {
     if (reconnectTimeout !== null) {
       clearTimeout(reconnectTimeout);
     }
-
+  
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.log(
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
-
-      // Check if Redis client is connected before disconnecting
-      if (redisClient.isOpen) {
-        redisClient
-          .disconnect()
-          .then(() => {
-            console.log("Redis disconnected successfully");
-          })
-          .catch((err) => {
-            console.error("Error disconnecting Redis:", err);
-          });
-      } else {
-        console.log("Redis client is already disconnected");
-      }
-
+  
       // Reinitialize the FIX client
       this.client.removeAllListeners();
       this.client.destroy();
       this.initializeClient();
-
+  
+      // Ensure Redis is connected
+      if (!redisClient.isOpen) {
+        try {
+          console.log("Reconnecting to Redis...");
+          await redisClient.connect();
+          console.log("Successfully reconnected to Redis");
+        } catch (err) {
+          console.error("Failed to reconnect to Redis:", err);
+          // Continue with reconnection attempt despite Redis failure
+        }
+      }
+  
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
-
-      // Reconnect to Redis
-      redisClient
-        .connect()
-        .then(() => {
-          console.log("Reconnected to Redis");
-        })
-        .catch((err) => {
-          console.error("Failed to reconnect to Redis:", err);
-        });
     } else {
       console.log(
         `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`
