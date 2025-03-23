@@ -850,6 +850,8 @@ class FixClient {
     const parsed = this.parseFixMessage(logonMessage);
     console.log("Logon sent");
     this.logParsedMessage(parsed, "Sent");
+
+    this.startHeartbeat()
   }
 
   private handleData(data: Buffer) {
@@ -1045,6 +1047,18 @@ class FixClient {
     return messages;
   }
 
+  private startHeartbeat() {
+    setInterval(() => {
+      if (isConnected) {
+        const heartbeatMessage = createFixMessage({
+          35: "0", // Heartbeat
+        });
+        this.client.write(heartbeatMessage);
+        console.log("Sent Heartbeat to server");
+      }
+    }, 30000); // Send every 30 seconds
+  }
+
   private handleError(err: Error) {
     console.log("Socket error:", err.message);
     if (isConnected) {
@@ -1076,15 +1090,19 @@ class FixClient {
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
   
-      // Properly disconnect Redis before reconnecting
-      redisClient
-        .disconnect()
-        .then(() => {
-          console.log("Redis disconnected successfully");
-        })
-        .catch((err) => {
-          console.error("Error disconnecting Redis:", err);
-        });
+      // Check if Redis client is connected before disconnecting
+      if (redisClient.isOpen) {
+        redisClient
+          .disconnect()
+          .then(() => {
+            console.log("Redis disconnected successfully");
+          })
+          .catch((err) => {
+            console.error("Error disconnecting Redis:", err);
+          });
+      } else {
+        console.log("Redis client is already disconnected");
+      }
   
       // Reinitialize the FIX client
       this.client.removeAllListeners();
