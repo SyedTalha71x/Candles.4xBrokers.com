@@ -1,0 +1,1494 @@
+import { Socket } from "net";
+import pkg from "pg";
+const { Pool } = pkg;
+import Bull from "bull";
+import { configDotenv } from "dotenv";
+import { createClient } from "redis";
+import { v4 as uuidv4 } from "uuid";
+import express from "express";
+import type { Request, Response } from "express";
+import { RedisCommandArgument } from "@redis/client/dist/lib/commands/index.js";
+import { ZRangeByScoreOptions } from "@redis/client/dist/lib/commands/ZRANGEBYSCORE.js";
+
+const app = express();
+const PORT = 3000; 
+
+app.use(express.json());
+
+configDotenv();
+
+const FIX_SERVER = process.env.FIX_SERVER;
+const FIX_PORT = process.env.FIX_PORT;
+const SENDER_COMP_ID = process.env.SENDER_COMP_ID;
+const TARGET_COMP_ID = process.env.TARGET_COMP_ID;
+const USERNAME = process.env.USERNAME;
+const PASSWORD = process.env.PASSWORD;
+
+const PG_HOST = process.env.PG_HOST;
+const PG_PORT = process.env.PG_PORT;
+const PG_USER = process.env.PG_USER;
+const PG_PASSWORD = process.env.PG_PASSWORD;
+const PG_DATABASE = process.env.PG_DATABASE;
+
+const REDIS_HOST = process.env.REDIS_HOST || "localhost";
+const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
+
+if (
+  !FIX_SERVER ||
+  !FIX_PORT ||
+  !SENDER_COMP_ID ||
+  !TARGET_COMP_ID ||
+  !USERNAME ||
+  !PASSWORD
+) {
+  console.log(
+    "One or more required environment variables are missing, using sample mode."
+  );
+}
+
+const redisClient = createClient({
+  url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
+  socket: {
+    reconnectStrategy: (retries) => {
+      const delay = Math.min(retries * 50, 2000);
+      console.log(`Redis reconnecting, attempt ${retries}, next try in ${delay}ms`);
+      return delay;
+    }
+  }
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+
+redisClient
+  .connect()
+  .then(() => {
+    console.log("Connected to Redis");
+    setupRedisHealthCheck();
+  })
+  .catch((err) => {
+    console.error("Failed to connect to Redis:", err);
+  });
+
+const timeFrames = {
+  M1: 60000,
+  H1: 3600000,
+  D1: 86400000,
+};
+
+let sequenceNumber = 0;
+let isConnected = false;
+let reconnectTimeout: NodeJS.Timeout | null = null;
+
+
+
+interface MarketDataMessage {
+  symbol: string;
+  type: "BID" | "ASK";
+  price: number;
+  quantity: number;
+  timestamp: string;
+  rawData: Record<string, string>;
+}
+
+interface TickData {
+  symbol: string;
+  price: number;
+  timestamp: Date;
+  lots: number;
+}
+
+app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
+  try {
+    let { symbol, fsym, tsym, resolution, startDate, endDate, limit, tt } = req.query;
+
+    if (!symbol) {
+      if (!fsym || !tsym) {
+        res.status(400).json({ success: false, message: "Missing required query parameters: symbol or (fsym, tsym)" });
+        return;
+      }
+      symbol = `${fsym}${tsym}`;
+    }
+
+    const resolutionMap: Record<string, string> = {
+      "1M": "M1",
+      "1H": "H1",
+      "1D": "D1",
+    };
+
+    if (!resolution || !resolutionMap[resolution as string]) {
+      res.status(400).json({ success: false, message: "Invalid or missing resolution (Allowed: 1M, 1H, 1D)" });
+      return;
+    }
+    const candleSize = resolutionMap[resolution as string];
+    // console.log(candleSize, "candle size ------");
+    
+    // Timestamp & Limit Handling
+    let startTimestamp = 0;
+    let endTimestamp = 0;
+    let fetchLimit = 0;
+
+    if (startDate && endDate) {
+      startTimestamp = Math.floor(new Date(startDate as string).getTime() / 1000);
+      endTimestamp = Math.floor(new Date(endDate as string).getTime() / 1000);
+      if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
+        res.status(400).json({ success: false, message: "Invalid date format. Use ISO format." });
+        return;
+      }
+    } else if (limit) {
+      fetchLimit = parseInt(limit as string);
+      if (isNaN(fetchLimit) || fetchLimit <= 0) {
+        res.status(400).json({ success: false, message: "Invalid limit value." });
+        return;
+      }
+    } else {
+      res.status(400).json({ success: false, message: "Either (startDate & endDate) or limit is required." });
+      return;
+    }
+
+    const redisKey = `${symbol}_${candleSize}`;
+
+    let candleData: string[];
+    if (fetchLimit > 0) {
+      candleData = await redisClient.zRange(redisKey as RedisCommandArgument, -fetchLimit, -1);
+    } else {
+      candleData = await redisClient.zRangeByScore(
+        redisKey as RedisCommandArgument,
+        startTimestamp.toString(),
+        endTimestamp.toString(),
+        { WITHSCORES: true } as ZRangeByScoreOptions
+      );
+    }
+
+    // Fetch Trader Type Markup
+    let markup = 0;
+    if (tt && ["R", "I", "S", "T"].includes(tt as string)) {
+      const markupKey = `markup_${symbol}_${tt}_B`;
+      const markupValue = await redisClient.get(markupKey);
+      if (markupValue) markup = parseFloat(markupValue);
+    }
+
+    // Parse Candlestick Data & Apply Markup
+    const parsedCandles = candleData
+      .map((value, index) => (index % 2 === 0 ? JSON.parse(value) : null))
+      .filter((value) => value !== null)
+      .map((candle) => ({
+        ...candle,
+        open: parseFloat((candle.open - markup).toFixed(10)),
+        high: parseFloat((candle.high - markup).toFixed(10)),
+        low: parseFloat((candle.low - markup).toFixed(10)),
+        close: parseFloat((candle.close - markup).toFixed(10)),
+      }));
+
+    res.status(200).json({ success: true, data: parsedCandles });
+  } catch (error) {
+    console.error("Error fetching candle data:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch candle data" });
+  }
+});
+
+
+app.listen(PORT, '0.0.0.0', ()=>{
+  console.log(`Server is running ${PORT}`);
+})
+
+
+function setupRedisHealthCheck() {
+  const HEALTH_CHECK_INTERVAL = 30000;
+  
+  setInterval(async () => {
+    try {
+      if (!redisClient.isOpen) {
+        console.log("Redis connection is down, attempting to reconnect...");
+        await redisClient.connect();
+        console.log("Redis connection restored");
+      } else {
+        // Perform a simple ping to verify the connection is actually working
+        await redisClient.ping();
+      }
+    } catch (error) {
+      console.error("Redis health check failed:", error);
+      
+      // If we get here, the connection is broken but isOpen might still be true
+      // Force a reconnection
+      try {
+        if (redisClient.isOpen) {
+          await redisClient.disconnect();
+        }
+        await redisClient.connect();
+        console.log("Redis connection restored after forced reconnection");
+      } catch (reconnectError) {
+        console.error("Failed to restore Redis connection:", reconnectError);
+      }
+    }
+  }, HEALTH_CHECK_INTERVAL);
+}
+
+const marketDataQueue = new Bull("marketData", {
+  redis: {
+    host: REDIS_HOST,
+    port: REDIS_PORT,
+  },
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: "exponential",
+      delay: 1000,
+    },
+    removeOnComplete: true,
+    timeout: 30000, // Increase job timeout to 30 seconds
+  },
+  limiter: {
+    max: 100, // Max jobs processed per second
+    duration: 1000,
+  },
+  settings: {
+    maxStalledCount: 1, // Prevent jobs from being marked as stalled too quickly
+  },
+});
+const candleProcessingQueue = new Bull("candleProcessing", {
+  redis: {
+    host: REDIS_HOST,
+    port: REDIS_PORT,
+  },
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: "exponential",
+      delay: 1000,
+    },
+    removeOnComplete: true,
+    timeout: 30000,
+  },
+  limiter: {
+    max: 50, // Lower limit for candle processing as it's more resource-intensive
+    duration: 1000,
+  },
+});
+const MESSAGE_TYPES: Record<string, string> = {
+  "0": "Heartbeat",
+  "1": "Test Request",
+  "2": "Resend Request",
+  "3": "Reject",
+  "4": "Sequence Reset",
+  "5": "Logout",
+  A: "Logon",
+  V: "Market Data Request",
+  W: "Market Data Snapshot",
+  X: "Market Data Incremental Refresh",
+};
+const MD_ENTRY_TYPES: Record<string, string> = {
+  "0": "BID",
+  "1": "ASK",
+  "2": "TRADE",
+  "3": "INDEX_VALUE",
+  "4": "OPENING_PRICE",
+  "5": "CLOSING_PRICE",
+  "6": "SETTLEMENT_PRICE",
+  "7": "TRADING_SESSION_HIGH_PRICE",
+  "8": "TRADING_SESSION_LOW_PRICE",
+};
+
+interface ParsedFixMessage {
+  messageType: string;
+  senderCompId: string;
+  targetCompId: string;
+  msgSeqNum: number;
+  sendingTime: string;
+  rawMessage: string;
+  testReqId?: string;
+  username?: string;
+  additionalFields: Record<string, string>;
+}
+
+const pgPool = new Pool({
+  host: PG_HOST,
+  port: PG_PORT ? Number(PG_PORT) : 5432,
+  user: PG_USER,
+  password: PG_PASSWORD,
+  database: PG_DATABASE,
+});
+
+interface CurrencyPairInfo {
+  currpair: string;
+  contractsize: number | null;
+}
+
+// Store subscribable currency pairs
+let availableCurrencyPairs: CurrencyPairInfo[] = [];
+
+// Track subscribed currency pairs
+const subscribedPairs: Set<string> = new Set();
+
+async function fetchCandlesFromDatabase(symbol: string, resolution: string): Promise<any[]> {
+  const tableName = `candles_${symbol.toLowerCase()}_bid`;
+  const query = {
+    text: `
+      SELECT candletime, open, high, low, close
+      FROM ${tableName}
+      WHERE candlesize = $1
+      ORDER BY candletime ASC
+    `,
+    values: [resolution],
+  };
+
+  try {
+    const result = await pgPool.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error(`Error fetching candles from database for ${symbol} (${resolution}):`, error);
+    throw error;
+  }
+}
+
+async function populateRedisWithCandles(symbol: string, resolution: string): Promise<void> {
+  try {
+    const candles = await fetchCandlesFromDatabase(symbol, resolution);
+    const redisKey = `${symbol}_${resolution}`;
+
+    for (const candle of candles) {
+      const candleepoch = Math.floor(new Date(candle.candletime).getTime() / 1000);
+      const record = JSON.stringify({
+        time: candleepoch,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+      });
+
+      await redisClient.zAdd(redisKey, [
+        {
+          score: candleepoch,
+          value: record,
+        },
+      ]);
+    }
+
+    console.log(`Populated Redis with ${candles.length} candles for ${symbol} (${resolution})`);
+  } catch (error) {
+    console.error(`Error populating Redis with candles for ${symbol} (${resolution}):`, error);
+    }
+}
+
+async function populateRedisWithMarkuplots(): Promise<void> {
+  try {
+    const markuplotsData = await fetchMarkuplotsFromDatabase();
+
+    for (const row of markuplotsData) {
+      const { currpair, tradertype, decimals, mu_b, mu_a } = row;
+
+      // Ensure mu_b and mu_a are numbers
+      const markuppipsBid = typeof mu_b === 'number' ? parseFloat(mu_b.toFixed(decimals)) : 0;
+      const markuppipsAsk = typeof mu_a === 'number' ? parseFloat(mu_a.toFixed(decimals)) : 0;
+
+      // Create Redis keys
+      const redisKeyBid = `markup_${currpair}_${tradertype}_B`;
+      const redisKeyAsk = `markup_${currpair}_${tradertype}_A`;
+
+      // Store values in Redis
+      await redisClient.set(redisKeyBid, markuppipsBid);
+      await redisClient.set(redisKeyAsk, markuppipsAsk);
+
+      console.log(`Stored markuplots for ${currpair} (${tradertype}): Bid=${markuppipsBid}, Ask=${markuppipsAsk}`);
+    }
+
+    console.log("Successfully populated Redis with markuplots data");
+  } catch (error) {
+    console.error("Error populating Redis with markuplots data:", error);
+  }
+}
+
+export const ensureCandleTableExists = async (
+  tableName: string
+): Promise<void> => {
+  try {
+    const tableCheck = await pgPool.query(
+      `
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_schema = 'public'
+            AND table_name = $1
+        )
+        `,
+      [tableName]
+    );
+
+    if (!tableCheck.rows[0].exists) {
+      console.log(`Table ${tableName} does not exist, creating it...`);
+
+      // await pgPool.query(`
+      //     CREATE TABLE ${tableName} (
+      //         candlesize TEXT NOT NULL,
+      //         lots SMALLINT NOT NULL,
+      //         candletime TIMESTAMP WITH TIME ZONE NOT NULL,
+      //         open NUMERIC(12,5) NOT NULL,
+      //         high NUMERIC(12,5) NOT NULL,
+      //         low NUMERIC(12,5) NOT NULL,
+      //         close NUMERIC(12,5) NOT NULL,
+      //         PRIMARY KEY (candlesize, lots, candletime)
+      //     )
+      //   `);
+
+      // console.log(`Created candle table ${tableName}`);
+    }
+  } catch (error) {
+    console.error(`Error ensuring candle table ${tableName} exists:`, error);
+    throw error;
+  }
+};
+
+async function fetchMarkuplotsFromDatabase(): Promise<any[]> {
+  const query = `
+    WITH cpd AS (
+      SELECT currpair, pointsperunit, decimals, 
+             ROW_NUMBER() OVER (PARTITION BY currpair ORDER BY effdate DESC) AS rn 
+      FROM currpairdetails 
+      WHERE effdate <= NOW()
+    ),
+    mul AS (
+      SELECT currpair, tradertype, markuppips_bid, markuppips_ask, 
+             ROW_NUMBER() OVER (PARTITION BY currpair, tradertype ORDER BY effdate DESC) AS rn 
+      FROM markuplots 
+      WHERE effdate <= NOW()
+    )
+    SELECT mul.currpair, mul.tradertype, decimals, 
+           10 * markuppips_bid / pointsperunit AS mu_b, 
+           10 * markuppips_ask / pointsperunit AS mu_a
+    FROM cpd, mul
+    WHERE cpd.currpair = mul.currpair
+      AND cpd.rn = 1
+      AND mul.rn = 1
+    ORDER BY mul.currpair, mul.tradertype;
+  `;
+
+  try {
+    const result = await pgPool.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error("Error fetching markuplots data from database:", error);
+    throw error;
+  }
+}
+
+const initCandleTables = async () => {
+  try {
+    const result = await pgPool.query("SELECT currpair FROM currpairdetails");
+    const allCurrencyPairs = result.rows;
+
+    for (const pair of allCurrencyPairs) {
+      const tableName = `candles_${pair.currpair.toLowerCase()}_bid`;
+      // await ensureCandleTableExists(tableName);
+    }
+  } catch (error) {
+    console.error("Error initializing candle tables:", error);
+  }
+};
+
+const processTickForCandles = async (tickData: TickData) => {
+  try {
+    // Add to candle processing queue
+    await candleProcessingQueue.add(
+      {
+        tickData,
+        timeFrames: Object.keys(timeFrames),
+      },
+      {
+        jobId: `candle_${tickData.symbol}_${Date.now()}`,
+      }
+    );
+  } catch (error) {
+    console.error("Error adding tick to candle processing queue:", error);
+  }
+};
+
+const initDatabase = async () => {
+  try {
+    await fetchAllCurrencyPairs();
+    // await initCandleTables();
+
+    const resolutions = ["M1", "H1", "D1"]
+    for(const pair of availableCurrencyPairs){
+      for(const resolution of resolutions){
+        // populateRedisWithCandles(pair.currpair, resolution)
+        console.log("Populate all the candles data from database to redis successfully");
+        
+      }
+    }
+
+    await populateRedisWithMarkuplots();
+  } catch (error) {
+    console.error("Error initializing database tables:", error);
+  }
+};
+
+const fetchAllCurrencyPairs = async () => {
+  try {
+    const result = await pgPool.query(
+      "SELECT currpair, contractsize FROM currpairdetails"
+    );
+    availableCurrencyPairs = result.rows;
+
+    const validPairs = availableCurrencyPairs.filter(
+      (pair) => pair.contractsize !== null
+    );
+    const invalidPairs = availableCurrencyPairs.filter(
+      (pair) => pair.contractsize === null
+    );
+
+    if (invalidPairs.length > 0) {
+      console.log(
+        "Skipping subscription for the following pairs due to null contract size:"
+      );
+      invalidPairs.forEach((pair) => console.log(`- ${pair.currpair}`));
+    }
+
+    // Add valid pairs to subscribed set
+    validPairs.forEach((pair) => {
+      subscribedPairs.add(pair.currpair);
+    });
+
+    for (const pair of validPairs) {
+      // await ensureTableExists(
+      //   `ticks_${pair.currpair.toLowerCase()}_bid`,
+      //   "BID"
+      // );
+      // await ensureTableExists(
+      //   `ticks_${pair.currpair.toLowerCase()}_ask`,
+      //   "ASK"
+      // );
+    }
+  } catch (error) {
+    console.error("Error fetching currency pairs:", error);
+  }
+};
+
+const getUTCTimestamp = (): string => {
+  const now = new Date();
+  return `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(
+    2,
+    "0"
+  )}${String(now.getUTCDate()).padStart(2, "0")}-${String(
+    now.getUTCHours()
+  ).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}:${String(
+    now.getUTCSeconds()
+  ).padStart(2, "0")}.${String(now.getUTCMilliseconds()).padStart(3, "0")}`;
+};
+
+const calculateChecksum = (message: string): string => {
+  let sum = 0;
+  for (let i = 0; i < message.length; i++) {
+    sum += message.charCodeAt(i);
+  }
+  return (sum % 256).toString().padStart(3, "0");
+};
+
+const createFixMessage = (
+  body: Record<number | string, string | number>
+): string => {
+  sequenceNumber += 1;
+
+  const messageBody = [
+    `35=${body[35]}`,
+    `49=${SENDER_COMP_ID}`,
+    `56=${TARGET_COMP_ID}`,
+    `34=${sequenceNumber}`,
+    `52=${getUTCTimestamp()}`,
+    ...Object.entries(body)
+      .filter(([key]) => !["35"].includes(key))
+      .map(([key, value]) => `${key}=${value}`),
+  ].join("\u0001");
+
+  const bodyLength = messageBody.length;
+  let fullMessage = `8=FIX.4.4\u00019=${bodyLength}\u0001${messageBody}`;
+  const checksum = calculateChecksum(fullMessage + "\u0001");
+  return `${fullMessage}\u000110=${checksum}\u0001`;
+};
+
+const ensureTableExists = async (
+  tableName: string,
+  type: "BID" | "ASK"
+): Promise<void> => {
+  try {
+    const tableCheck = await pgPool.query(
+      `
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public'
+                AND table_name = $1
+            )
+        `,
+      [tableName]
+    );
+
+    if (!tableCheck.rows[0].exists) {
+      // await pgPool.query(`
+      //           CREATE TABLE ${tableName} (
+      //               ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
+      //               lots INTEGER PRIMARY KEY,
+      //               price NUMERIC NOT NULL
+      //           )
+      //       `);
+    }
+  } catch (error) {
+    console.error(`Error ensuring table ${tableName} exists:`, error);
+    throw error;
+  }
+};
+
+async function addRedisRecord(
+  redisKey: string,
+  candleData: any,
+  deleteExisting = false
+) {
+  try {
+    if (
+      candleData.candleepoch === undefined ||
+      isNaN(Number(candleData.candleepoch))
+    ) {
+      throw new Error(`Invalid score: ${candleData.candleepoch}`);
+    }
+
+    if (deleteExisting) {
+      const score = Number(candleData.candleepoch);
+      await redisClient.zRemRangeByScore(redisKey, score, score);
+    }
+
+    const score = Number(candleData.candleepoch);
+    console.log(score, "----score ");
+    
+
+    const record = JSON.stringify({
+      time: candleData.candleepoch,
+      open: candleData.open,
+      high: candleData.high,
+      low: candleData.low,
+      close: candleData.close,
+    });
+
+    await redisClient.zAdd(redisKey, [
+      {
+        score: score, // Score must be a number
+        value: record, // Value must be a string
+      },
+    ]);
+
+    // console.log(`Added/updated candle record for ${redisKey} at ${candleData.candleepoch}`);
+  } catch (error) {
+    console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
+  }
+}
+
+async function processTickResolution(
+  currpair: string,
+  lots: number,
+  price: number,
+  tickepoch: number,
+  resolution: string
+) {
+  const redisKey = `${currpair}_${resolution}`;
+
+  // console.log(`Processing tick for ${redisKey}:`, { tickepoch, price });
+
+  let floor;
+  switch (resolution) {
+    case "M1":
+      floor = Math.floor(tickepoch / 60) * 60;
+      break;
+    case "H1":
+      floor = Math.floor(tickepoch / 3600) * 3600;
+      break;
+    case "D1":
+      const date = new Date(tickepoch * 1000);
+      floor =
+        new Date(
+          date.getUTCFullYear(),
+          date.getUTCMonth(),
+          date.getUTCDate()
+        ).getTime() / 1000;
+      break;
+    default:
+      return;
+  }
+
+  // console.log(`Calculated floor for ${redisKey}:`, floor);
+
+  // Ensure candleepoch is defined
+  const candleepoch = floor;
+
+  // Check if a candle already exists for this timeframe
+  const existingCandle = await redisClient.zRangeByScore(
+    redisKey,
+    floor,
+    floor
+  );
+
+  if (existingCandle.length > 0) {
+    // Update existing candle
+    const candle = JSON.parse(existingCandle[0]);
+    candle.close = price;
+    candle.high = Math.max(candle.high, price);
+    candle.low = Math.min(candle.low, price);
+
+    await addRedisRecord(redisKey, { candleepoch, ...candle }, true);
+  } else {
+    // Create new candle
+    const newCandle = {
+      candleepoch, // Ensure this is a number
+      open: price, // Ensure this is a number
+      high: price, // Ensure this is a number
+      low: price, // Ensure this is a number
+      close: price, // Ensure this is a number
+    };
+
+    await addRedisRecord(redisKey, newCandle);
+  }
+}
+
+async function processTick(tickData) {
+  const { currpair, lots, price, tickepoch } = tickData;
+
+  const resolutions = ["M1", "H1", "D1"];
+
+  for (const resolution of resolutions) {
+    await processTickResolution(currpair, lots, price, tickepoch, resolution);
+  }
+}
+
+marketDataQueue.process(5, async (job) => {
+  try {
+    const data: MarketDataMessage = job.data;
+    // console.log(`Processing market data job for ${data.symbol} (${data.type})`);
+
+    const contractSize = await getContractSize(data.symbol);
+    // console.log(`Got contract size: ${contractSize} for ${data.symbol}`);
+
+    const lots = calculateLots(data.quantity, contractSize);
+
+    // Format time from data.timestamp
+    let ticktime = new Date();
+    if (data.rawData["273"]) {
+      const timeStr = data.rawData["273"];
+      const [hours, minutes, seconds] = timeStr.split(":").map(Number);
+      ticktime = new Date();
+      ticktime.setHours(hours, minutes, seconds);
+    }
+
+    // Determine which table to use based on the type
+    let tableName: string;
+    const symbolLower = data.symbol.toLowerCase();
+
+    if (data.type === "BID") {
+      tableName = `ticks_${symbolLower}_bid`;
+    } else {
+      tableName = `ticks_${symbolLower}_ask`;
+    }
+
+    await ensureTableExists(tableName, data.type);
+
+    // console.log(`Calculated ticktime:`, ticktime);
+
+    await processTick({
+      currpair: data.symbol,
+      lots: lots,
+      price: data.price,
+      tickepoch: Math.floor(ticktime.getTime() / 1000),
+    });
+
+    // const query = {
+    //   text: `
+    //             INSERT INTO ${tableName} 
+    //             (ticktime, lots, price)
+    //             VALUES ($1, $2, $3)
+    //             ON CONFLICT (lots) DO NOTHING;
+    //         `,
+    //   values: [ticktime.toISOString(), lots, data.price],
+    // };
+
+    // await pgPool.query(query);
+
+    if (data.type === "BID") {
+      await processTickForCandles({
+        symbol: data.symbol,
+        price: data.price,
+        timestamp: ticktime,
+        lots: lots,
+      });
+    }
+    // console.log(`Successfully inserted tick into ${tableName}`);
+
+    return { success: true, symbol: data.symbol, type: data.type };
+  } catch (error) {
+    console.error(`Error processing market data job:`, error);
+    throw error;
+  }
+});
+candleProcessingQueue.process(async (job) => {
+  const { tickData, timeFrames } = job.data;
+  const { symbol, price } = tickData;
+
+  const lots = 1;
+
+  const timestamp = new Date(tickData.timestamp);
+
+  if (isNaN(timestamp.getTime())) {
+    console.error(`Invalid timestamp for ${symbol}: ${tickData.timestamp}`);
+    throw new Error(`Invalid timestamp for ${symbol}`);
+  }
+
+  const defaultTimeFrames = {
+    M1: 60000,
+    H1: 3600000,
+    D1: 86400000,
+  };
+
+  // Ensure timeFrames is an object with valid values
+  const resolvedTimeFrames =
+    typeof timeFrames === "object" && !Array.isArray(timeFrames)
+      ? timeFrames
+      : defaultTimeFrames;
+
+  // For each timeframe (M1, H1, D1)
+  for (const timeframe of Object.keys(resolvedTimeFrames)) {
+    try {
+      const timeframeDuration = resolvedTimeFrames[timeframe];
+
+      // Ensure the timeframe duration is valid
+      if (typeof timeframeDuration !== "number" || isNaN(timeframeDuration)) {
+        console.error(
+          `Invalid duration for timeframe ${timeframe}:`,
+          timeframeDuration
+        );
+        continue;
+      }
+
+      // Calculate the candle time (start time of the candle)
+      const candleTimeMs =
+        Math.floor(timestamp.getTime() / timeframeDuration) * timeframeDuration;
+
+      const candleTime = new Date(candleTimeMs);
+
+      if (isNaN(candleTime.getTime())) {
+        console.error(
+          `Invalid candleTime for ${symbol} and timeframe ${timeframe}`
+        );
+        continue;
+      }
+
+      const tableName = `candles_${symbol.toLowerCase()}_bid`;
+
+      const tickepoch = Math.floor(timestamp.getTime() / 1000);
+
+      await processTick({
+        currpair: symbol,
+        lots: 1,
+        price: price,
+        tickepoch: tickepoch,
+      });
+
+      const existingCandleQuery = {
+        text: `
+          SELECT * FROM ${tableName}
+          WHERE candlesize = $1
+          AND lots = $2
+          AND candletime = $3
+        `,
+        values: [timeframe, lots, candleTime.toISOString()],
+      };
+
+      const existingCandle = await pgPool.query(existingCandleQuery);
+
+      if (existingCandle.rows.length > 0) {
+        // Update existing candle
+        const currentCandle = existingCandle.rows[0];
+
+        // const updateQuery = {
+        //   text: `
+        //     UPDATE ${tableName}
+        //     SET high = GREATEST(high, $1),
+        //         low = LEAST(low, $2),
+        //         close = $3
+        //     WHERE candlesize = $4
+        //     AND lots = $5
+        //     AND candletime = $6
+        //   `,
+        //   values: [
+        //     price,
+        //     price,
+        //     price,
+        //     timeframe,
+        //     lots,
+        //     candleTime.toISOString(),
+        //   ],
+        // };
+
+        // await pgPool.query(updateQuery);
+        // console.log(`Successfully updated candle in ${tableName}`);
+      } else {
+        // const insertQuery = {
+        //   text: `
+        //     INSERT INTO ${tableName}
+        //     (candlesize, lots, candletime, open, high, low, close)
+        //     VALUES ($1, $2, $3, $4, $5, $6, $7)
+        //   `,
+        //   values: [
+        //     timeframe,
+        //     lots,
+        //     candleTime.toISOString(),
+        //     price, // open
+        //     price, // high (same as open for new candle)
+        //     price, // low (same as open for new candle)
+        //     price, // close (same as open for new candle)
+        //   ],
+        // };
+
+        // await pgPool.query(insertQuery);
+        // console.log(`Successfully inserted candle in ${tableName}`);
+      }
+    } catch (error) {
+      console.error(
+        `Error processing ${timeframe} candle for ${symbol}:`,
+        error
+      );
+      throw error;
+    }
+  }
+
+  return { success: true, symbol };
+});
+
+marketDataQueue.on("completed", (job, result) => {
+  // console.log(`Job ${job.id} completed: ${result.symbol} ${result.type}`);
+});
+
+marketDataQueue.on("failed", (job, error) => {
+  console.error(` Job ${job.id} failed:`, error);
+});
+
+candleProcessingQueue.on("completed", (job, result) => {
+  // console.log(`job ${job.id} completed: ${result.symbol}`);
+});
+
+candleProcessingQueue.on("failed", (job, error) => {
+  console.error(` Job ${job.id} failed:`, error);
+});
+
+const getContractSize = async (symbol: string): Promise<number> => {
+  try {
+    const pairInfo = availableCurrencyPairs.find(
+      (pair) => pair.currpair === symbol
+    );
+
+    if (pairInfo && pairInfo.contractsize !== null) {
+      return parseFloat(pairInfo.contractsize.toString());
+    } else {
+      // Try to get the contract size directly from the database as a fallback
+      try {
+        const result = await pgPool.query(
+          "SELECT contractsize FROM currpairdetails WHERE currpair = $1",
+          [symbol]
+        );
+
+        if (result.rows.length > 0 && result.rows[0].contractsize !== null) {
+          return parseFloat(result.rows[0].contractsize.toString());
+        }
+      } catch (dbError) {
+        console.error(`Database lookup for contract size failed:`, dbError);
+      }
+
+      throw new Error(
+        `Cannot process data for ${symbol}: No valid contract size found`
+      );
+    }
+  } catch (error) {
+    console.error(`Error getting contract size for ${symbol}:`, error);
+    throw new Error(`Cannot process market data: ${error.message}`);
+  }
+};
+
+const calculateLots = (quantity: number, contractSize: number): number => {
+  return Math.round(quantity / contractSize);
+};
+
+class FixClient {
+  private client!: Socket;
+  private reconnectAttempts: number = 0;
+  private readonly maxReconnectAttempts: number = 1000;
+  private readonly reconnectDelay: number = 5000;
+  private buffer: string = "";
+
+  constructor() {
+    this.initializeClient();
+    // Initialize database
+    initDatabase().catch((err) => {
+      console.error("Failed to initialize database:", err);
+    });
+  }
+
+  private initializeClient() {
+    this.client = new Socket();
+    this.client.setKeepAlive(true, 30000);
+    this.client.setNoDelay(true);
+    this.setupEventHandlers();
+  }
+
+  private setupEventHandlers() {
+    this.client.on("connect", this.handleConnect.bind(this));
+    this.client.on("data", this.handleData.bind(this));
+    this.client.on("error", this.handleError.bind(this));
+    this.client.on("close", this.handleClose.bind(this));
+    this.client.on("end", this.handleEnd.bind(this));
+  }
+
+  private parseFixMessage(message: string): ParsedFixMessage {
+    const fields = message.split("\u0001");
+    const fieldMap: Record<string, string> = {};
+
+    // Parse all fields into key-value pairs
+    fields.forEach((field) => {
+      const [key, value] = field.split("=");
+      if (key && value) {
+        fieldMap[key] = value;
+      }
+    });
+
+    // Extract common fields
+    const messageType = fieldMap["35"];
+    const readableType =
+      MESSAGE_TYPES[messageType] || `Unknown (${messageType})`;
+
+    const parsed: ParsedFixMessage = {
+      messageType: readableType,
+      senderCompId: fieldMap["49"] || "",
+      targetCompId: fieldMap["56"] || "",
+      msgSeqNum: parseInt(fieldMap["34"] || "0"),
+      sendingTime: fieldMap["52"] || "",
+      rawMessage: message,
+      additionalFields: {},
+    };
+
+    // Add optional fields if present
+    if (fieldMap["112"]) parsed.testReqId = fieldMap["112"];
+    if (fieldMap["553"]) parsed.username = fieldMap["553"];
+
+    // Add any other fields to additionalFields
+    Object.entries(fieldMap).forEach(([key, value]) => {
+      if (
+        !["8", "9", "35", "49", "56", "34", "52", "10", "112", "553"].includes(
+          key
+        )
+      ) {
+        parsed.additionalFields[key] = value;
+      }
+    });
+
+    return parsed;
+  }
+
+  private logParsedMessage(
+    parsed: ParsedFixMessage,
+    direction: "Sent" | "Received"
+  ) {
+    const timestamp = new Date().toISOString();
+    console.log("\n" + "=".repeat(80));
+    console.log(`${direction} at ${timestamp}`);
+    console.log("-".repeat(80));
+    console.log(`Message Type: ${parsed.messageType}`);
+    console.log(`From: ${parsed.senderCompId}`);
+    console.log(`To: ${parsed.targetCompId}`);
+    console.log(`Sequence: ${parsed.msgSeqNum}`);
+    console.log(`Time: ${parsed.sendingTime}`);
+
+    if (parsed.testReqId) {
+      console.log(`Test Request ID: ${parsed.testReqId}`);
+    }
+
+    if (Object.keys(parsed.additionalFields).length > 0) {
+      console.log("\nAdditional Fields:");
+      Object.entries(parsed.additionalFields).forEach(([key, value]) => {
+        console.log(`  ${key}: ${value}`);
+      });
+    }
+    console.log("=".repeat(80) + "\n");
+  }
+
+  private resetSequenceNumber() {
+    sequenceNumber = 0;
+    console.log("Reset sequence number to 0");
+  }
+
+  private handleConnect() {
+    console.log("Connected to FIX server");
+    isConnected = true;
+    this.reconnectAttempts = 0;
+    this.buffer = "";
+
+    console.log("Redis cache cleared on reconnect");
+
+    const logonMessage = createFixMessage({
+      35: "A",
+      98: 0,
+      108: 30,
+      553: USERNAME || "",
+      554: PASSWORD || "",
+      141: "Y",
+    });
+
+    this.client.write(logonMessage);
+    const parsed = this.parseFixMessage(logonMessage);
+    console.log("Logon sent");
+    this.logParsedMessage(parsed, "Sent");
+  }
+
+  private handleData(data: Buffer) {
+    // Append the new data to our buffer
+    this.buffer += data.toString();
+
+    // Process any complete FIX messages in the buffer
+    const messages = this.extractMessages();
+
+    for (const message of messages) {
+      // console.log("RAW MESSAGE RECEIVED:", message);
+
+      const parsed = this.parseFixMessage(message);
+      // this.logParsedMessage(parsed, "Received");
+
+      // Process market data messages
+      if (
+        parsed.messageType === "Market Data Snapshot" ||
+        parsed.messageType === "Market Data Incremental Refresh"
+      ) {
+        // console.log("Received market data response!");
+
+        try {
+          // Extract market data entries
+          const noMDEntries = parseInt(parsed.additionalFields["268"] || "0");
+          const symbol = parsed.additionalFields["55"] || "";
+
+          // console.log(
+          //   `Got market data for symbol: ${symbol}, entries: ${noMDEntries}`
+          // );
+
+          if (noMDEntries > 0 && symbol) {
+            // Process all incoming data regardless of subscription status
+            // console.log(
+            //   `Processing ${noMDEntries} market data entries for ${symbol}`
+            // );
+
+            // Extract all fields directly from the raw message
+            const rawFields = message.split("\u0001");
+            const fieldMap: Record<string, string> = {};
+
+            rawFields.forEach((field) => {
+              const [tag, value] = field.split("=");
+              if (tag && value) {
+                fieldMap[tag] = value;
+              }
+            });
+
+            // Find all repeating group entries in the original message
+            const mdEntries: Array<Record<string, string>> = [];
+            let currentEntry: Record<string, string> = {};
+            let inEntry = false;
+
+            // Process the fields in order
+            for (const field of rawFields) {
+              const [tag, value] = field.split("=");
+              if (!tag || !value) continue;
+
+              // Check if this is the beginning of a new entry (MDEntryType)
+              if (tag === "269") {
+                if (inEntry && Object.keys(currentEntry).length > 0) {
+                  // Save the previous entry
+                  mdEntries.push(currentEntry);
+                }
+                // Start a new entry
+                currentEntry = {};
+                inEntry = true;
+              }
+
+              // If we're in an entry, collect its fields
+              if (inEntry) {
+                if (["269", "270", "271", "273"].includes(tag)) {
+                  currentEntry[tag] = value;
+                }
+              }
+            }
+
+            // Add the last entry if it exists
+            if (inEntry && Object.keys(currentEntry).length > 0) {
+              mdEntries.push(currentEntry);
+            }
+
+            // console.log(`Extracted ${mdEntries.length} market data entries`);
+
+            // Process each entry
+            for (let i = 0; i < mdEntries.length; i++) {
+              const entry = mdEntries[i];
+              // console.log(
+              //   `Entry ${i + 1} - Type: ${entry["269"]}, Price: ${entry["270"]
+              //   }, Size: ${entry["271"]}`
+              // );
+
+              if (entry["269"] && entry["270"]) {
+                const entryType = entry["269"];
+                const price = parseFloat(entry["270"]);
+                const size = parseFloat(entry["271"] || "0");
+                const time = entry["273"] || "";
+
+                if (["0", "1"].includes(entryType)) {
+                  // BID or ASK
+                  const type = MD_ENTRY_TYPES[entryType];
+
+                  // console.log(
+                  //   `Found ${type} entry for ${symbol}: Price=${price}, Size=${size}`
+                  // );
+
+                  // Create market data message and add to queue
+                  const marketData: MarketDataMessage = {
+                    symbol,
+                    type: type as "BID" | "ASK",
+                    price,
+                    quantity: size,
+                    timestamp: new Date().toISOString(),
+                    rawData: {
+                      "55": symbol,
+                      "262": parsed.additionalFields["262"] || "",
+                      "268": parsed.additionalFields["268"] || "",
+                      "269": entryType,
+                      "270": price.toString(),
+                      "271": size.toString(),
+                      "273": time,
+                    },
+                  };
+
+                  // console.log(`Adding to queue: ${JSON.stringify(marketData)}`);
+                  marketDataQueue.add(marketData, {
+                    jobId: `${symbol}_${type}_${Date.now()}`,
+                  });
+
+                  // console.log(
+                  //   `Added ${type} data for ${symbol} to queue: ${price}`
+                  // );
+                }
+              }
+            }
+          } else {
+            console.log(
+              `No market data entries found for ${symbol || "unknown symbol"}`
+            );
+          }
+        } catch (error) {
+          console.error("Error processing market data:", error);
+        }
+      } else if (parsed.messageType === "Reject") {
+        console.error(
+          "Request rejected by server:",
+          parsed.additionalFields["58"] || "Unknown reason"
+        );
+      } else if (parsed.messageType === "Logon") {
+        console.log("Logon response received, authentication successful");
+        // Subscribe after successful logon with a small delay
+        setTimeout(() => {
+          this.subscribeToMarketData();
+        }, 1000);
+      } else if (parsed.messageType === "Heartbeat") {
+        console.log("Received heartbeat from server");
+      } else {
+        console.log(`Received message of type: ${parsed.messageType}`);
+      }
+    }
+  }
+
+  private extractMessages(): string[] {
+    const messages: string[] = [];
+    const delimiter = "\u000110=";
+    let position = 0;
+
+    while (true) {
+      const start = this.buffer.indexOf("8=FIX", position);
+      if (start === -1) break;
+
+      const end = this.buffer.indexOf(delimiter, start);
+      if (end === -1) break;
+
+      // Find the end of the checksum (3 more characters after the delimiter)
+      const checksumEnd = end + delimiter.length + 3;
+      if (checksumEnd > this.buffer.length) break;
+
+      // Extract the complete message including the checksum
+      const message = this.buffer.substring(start, checksumEnd + 1);
+      messages.push(message);
+
+      // Move position past this message
+      position = checksumEnd + 1;
+    }
+
+    // Remove processed messages from the buffer
+    if (position > 0) {
+      this.buffer = this.buffer.substring(position);
+    }
+
+    return messages;
+  }
+
+  private handleError(err: Error) {
+    console.log("Socket error:", err.message);
+    if (isConnected) {
+      isConnected = false;
+    }
+    this.reconnect();
+  }
+
+  private handleClose(hadError: boolean) {
+    console.log("Connection closed", hadError ? "due to error" : "normally");
+    isConnected = false;
+    this.reconnect();
+  }
+  private handleEnd() {
+    console.log("Connection ended");
+    isConnected = false;
+    this.reconnect();
+  }
+
+  private async reconnect() {
+    if (reconnectTimeout !== null) {
+      clearTimeout(reconnectTimeout);
+    }
+  
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      console.log(
+        `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
+      );
+  
+      // Ensure the socket is properly destroyed before reconnecting
+      if (this.client && !this.client.destroyed) {
+        this.client.destroy();
+      }
+  
+      // Reinitialize the FIX client
+      this.initializeClient();
+  
+      // Ensure Redis is connected
+      if (!redisClient.isOpen) {
+        try {
+          console.log("Reconnecting to Redis...");
+          await redisClient.connect();
+          console.log("Successfully reconnected to Redis");
+        } catch (err) {
+          console.error("Failed to reconnect to Redis:", err);
+        }
+      }
+  
+      // Attempt to reconnect to the FIX server
+      reconnectTimeout = setTimeout(() => {
+        this.connect();
+      }, this.reconnectDelay);
+    } else {
+      console.log(
+        `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`
+      );
+    }
+  }
+
+  public connect() {
+    try {
+      console.log(`Connecting to FIX server at ${FIX_SERVER}:${FIX_PORT}...`);
+      this.client.connect(Number(FIX_PORT), FIX_SERVER);
+    } catch (error) {
+      console.error("Error connecting to FIX server:", error);
+      this.reconnect();
+    }
+  }
+
+  public subscribeToMarketData() {
+    if (!isConnected) {
+      console.log(
+        "Not connected to FIX server. Cannot subscribe to market data."
+      );
+      return;
+    }
+
+    const pairsToSubscribe = availableCurrencyPairs.filter((pair) =>
+      subscribedPairs.has(pair.currpair)
+    );
+
+    // console.log(`Found ${pairsToSubscribe.length} valid pairs to subscribe`);
+
+    for (const pair of pairsToSubscribe) {
+      // console.log(
+      //   `Subscribing to market data for ${pair.currpair} with contract size ${pair.contractsize}`
+      // );
+
+      sequenceNumber++;
+
+      const uniqueId = uuidv4();
+      const mdReqId = `MDR_${uniqueId}`;
+
+      const messageBody = [
+        "35=V", // Message Type (V = Market Data Request)
+        `49=${SENDER_COMP_ID}`, // SenderCompID
+        `56=${TARGET_COMP_ID}`, // TargetCompID
+        `34=${sequenceNumber}`, // MsgSeqNum
+        `52=${getUTCTimestamp()}`, // SendingTime
+        `262=${mdReqId}`, // MDReqID (unique identifier)
+        "263=1", // SubscriptionRequestType (1 = Snapshot + Updates)
+        "264=0", // MarketDepth (0 = Full Book)
+        "267=2", // NoMDEntryTypes (2 types: BID and ASK)
+        "269=0", // First MDEntryType - BID
+        "269=1", // Second MDEntryType - ASK
+        "146=1", // NoRelatedSym (1 symbol)
+        `55=${pair.currpair}`, // Symbol
+      ].join("\u0001");
+
+      const bodyLength = messageBody.length;
+      let fullMessage = `8=FIX.4.4\u00019=${bodyLength}\u0001${messageBody}`;
+
+      const checksum = calculateChecksum(fullMessage + "\u0001");
+      fullMessage = `${fullMessage}\u000110=${checksum}\u0001`;
+
+      this.client.write(fullMessage);
+
+      // console.log(`Sent market data subscription request for ${pair.currpair}`);
+
+      // Add a small delay between requests to prevent overwhelming the server
+      if (pairsToSubscribe.indexOf(pair) < pairsToSubscribe.length - 1) {
+        // console.log("Waiting before sending next subscription...");
+        setTimeout(() => {}, 200);
+      }
+    }
+  }
+
+  public disconnect() {
+    if (isConnected) {
+      const logoutMessage = createFixMessage({
+        35: "5", // Logout
+      });
+      this.client.write(logoutMessage);
+      console.log("Logout message sent");
+    }
+    this.client.end();
+  }
+}
+
+const fixClient = new FixClient();
+
+fixClient.connect();
+
+process.on("SIGINT", async () => {
+  console.log("Shutting down...");
+  fixClient.disconnect();
+
+  console.log("Closing Bull queue...");
+  await marketDataQueue.close();
+  await candleProcessingQueue.close();
+
+  console.log("Closing Redis connection...");
+  await redisClient.quit();
+
+  pgPool.end().then(() => {
+    console.log("Database connection closed");
+    process.exit(0);
+  });
+});
