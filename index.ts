@@ -479,6 +479,8 @@ async function addRedisRecord(
     }
 
     const score = Number(candleData.candleepoch);
+    console.log(score, "----score ");
+    
 
     const record = JSON.stringify({
       time: candleData.candleepoch,
@@ -488,7 +490,6 @@ async function addRedisRecord(
       close: candleData.close,
     });
 
-    // Add the new record
     await redisClient.zAdd(redisKey, [
       {
         score: score, // Score must be a number
