@@ -317,6 +317,34 @@ async function populateRedisWithCandles(symbol: string, resolution: string): Pro
     }
 }
 
+async function populateRedisWithMarkuplots(): Promise<void> {
+  try {
+    const markuplotsData = await fetchMarkuplotsFromDatabase();
+
+    for (const row of markuplotsData) {
+      const { currpair, tradertype, decimals, mu_b, mu_a } = row;
+
+      // Round the values to the specified number of decimals
+      const markuppipsBid = parseFloat(mu_b.toFixed(decimals));
+      const markuppipsAsk = parseFloat(mu_a.toFixed(decimals));
+
+      // Create Redis keys
+      const redisKeyBid = `markup_${currpair}_${tradertype}_B`;
+      const redisKeyAsk = `markup_${currpair}_${tradertype}_A`;
+
+      // Store values in Redis
+      await redisClient.set(redisKeyBid, markuppipsBid);
+      await redisClient.set(redisKeyAsk, markuppipsAsk);
+
+      console.log(`Stored markuplots for ${currpair} (${tradertype}): Bid=${markuppipsBid}, Ask=${markuppipsAsk}`);
+    }
+
+    console.log("Successfully populated Redis with markuplots data");
+  } catch (error) {
+    console.error("Error populating Redis with markuplots data:", error);
+  }
+}
+
 export const ensureCandleTableExists = async (
   tableName: string
 ): Promise<void> => {
@@ -335,26 +363,60 @@ export const ensureCandleTableExists = async (
     if (!tableCheck.rows[0].exists) {
       console.log(`Table ${tableName} does not exist, creating it...`);
 
-      await pgPool.query(`
-          CREATE TABLE ${tableName} (
-              candlesize TEXT NOT NULL,
-              lots SMALLINT NOT NULL,
-              candletime TIMESTAMP WITH TIME ZONE NOT NULL,
-              open NUMERIC(12,5) NOT NULL,
-              high NUMERIC(12,5) NOT NULL,
-              low NUMERIC(12,5) NOT NULL,
-              close NUMERIC(12,5) NOT NULL,
-              PRIMARY KEY (candlesize, lots, candletime)
-          )
-        `);
+      // await pgPool.query(`
+      //     CREATE TABLE ${tableName} (
+      //         candlesize TEXT NOT NULL,
+      //         lots SMALLINT NOT NULL,
+      //         candletime TIMESTAMP WITH TIME ZONE NOT NULL,
+      //         open NUMERIC(12,5) NOT NULL,
+      //         high NUMERIC(12,5) NOT NULL,
+      //         low NUMERIC(12,5) NOT NULL,
+      //         close NUMERIC(12,5) NOT NULL,
+      //         PRIMARY KEY (candlesize, lots, candletime)
+      //     )
+      //   `);
 
-      console.log(`Created candle table ${tableName}`);
+      // console.log(`Created candle table ${tableName}`);
     }
   } catch (error) {
     console.error(`Error ensuring candle table ${tableName} exists:`, error);
     throw error;
   }
 };
+
+async function fetchMarkuplotsFromDatabase(): Promise<any[]> {
+  const query = `
+    WITH cpd AS (
+      SELECT currpair, pointsperunit, decimals, 
+             ROW_NUMBER() OVER (PARTITION BY currpair ORDER BY effdate DESC) AS rn 
+      FROM currpairdetails 
+      WHERE effdate <= NOW()
+    ),
+    mul AS (
+      SELECT currpair, tradertype, markuppips_bid, markuppips_ask, 
+             ROW_NUMBER() OVER (PARTITION BY currpair, tradertype ORDER BY effdate DESC) AS rn 
+      FROM markuplots 
+      WHERE effdate <= NOW()
+    )
+    SELECT mul.currpair, mul.tradertype, decimals, 
+           10 * markuppips_bid / pointsperunit AS mu_b, 
+           10 * markuppips_ask / pointsperunit AS mu_a
+    FROM cpd, mul
+    WHERE cpd.currpair = mul.currpair
+      AND cpd.rn = 1
+      AND mul.rn = 1
+    ORDER BY mul.currpair, mul.tradertype;
+  `;
+
+  try {
+    const result = await pgPool.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error("Error fetching markuplots data from database:", error);
+    throw error;
+  }
+}
+
 
 const initCandleTables = async () => {
   try {
@@ -363,7 +425,7 @@ const initCandleTables = async () => {
 
     for (const pair of allCurrencyPairs) {
       const tableName = `candles_${pair.currpair.toLowerCase()}_bid`;
-      await ensureCandleTableExists(tableName);
+      // await ensureCandleTableExists(tableName);
     }
   } catch (error) {
     console.error("Error initializing candle tables:", error);
@@ -390,16 +452,18 @@ const processTickForCandles = async (tickData: TickData) => {
 const initDatabase = async () => {
   try {
     await fetchAllCurrencyPairs();
-    await initCandleTables();
+    // await initCandleTables();
 
     const resolutions = ["M1", "H1", "D1"]
     for(const pair of availableCurrencyPairs){
       for(const resolution of resolutions){
-        populateRedisWithCandles(pair.currpair, resolution)
+        // populateRedisWithCandles(pair.currpair, resolution)
         console.log("Populate all the candles data from database to redis successfully");
         
       }
     }
+
+    await populateRedisWithMarkuplots();
   } catch (error) {
     console.error("Error initializing database tables:", error);
   }
@@ -432,14 +496,14 @@ const fetchAllCurrencyPairs = async () => {
     });
 
     for (const pair of validPairs) {
-      await ensureTableExists(
-        `ticks_${pair.currpair.toLowerCase()}_bid`,
-        "BID"
-      );
-      await ensureTableExists(
-        `ticks_${pair.currpair.toLowerCase()}_ask`,
-        "ASK"
-      );
+      // await ensureTableExists(
+      //   `ticks_${pair.currpair.toLowerCase()}_bid`,
+      //   "BID"
+      // );
+      // await ensureTableExists(
+      //   `ticks_${pair.currpair.toLowerCase()}_ask`,
+      //   "ASK"
+      // );
     }
   } catch (error) {
     console.error("Error fetching currency pairs:", error);
@@ -505,13 +569,13 @@ const ensureTableExists = async (
     );
 
     if (!tableCheck.rows[0].exists) {
-      await pgPool.query(`
-                CREATE TABLE ${tableName} (
-                    ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
-                    lots INTEGER PRIMARY KEY,
-                    price NUMERIC NOT NULL
-                )
-            `);
+      // await pgPool.query(`
+      //           CREATE TABLE ${tableName} (
+      //               ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
+      //               lots INTEGER PRIMARY KEY,
+      //               price NUMERIC NOT NULL
+      //           )
+      //       `);
     }
   } catch (error) {
     console.error(`Error ensuring table ${tableName} exists:`, error);
@@ -678,17 +742,18 @@ marketDataQueue.process(5, async (job) => {
       tickepoch: Math.floor(ticktime.getTime() / 1000),
     });
 
-    const query = {
-      text: `
-                INSERT INTO ${tableName} 
-                (ticktime, lots, price)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (lots) DO NOTHING;
-            `,
-      values: [ticktime.toISOString(), lots, data.price],
-    };
+    // const query = {
+    //   text: `
+    //             INSERT INTO ${tableName} 
+    //             (ticktime, lots, price)
+    //             VALUES ($1, $2, $3)
+    //             ON CONFLICT (lots) DO NOTHING;
+    //         `,
+    //   values: [ticktime.toISOString(), lots, data.price],
+    // };
 
-    await pgPool.query(query);
+    // await pgPool.query(query);
+
     if (data.type === "BID") {
       await processTickForCandles({
         symbol: data.symbol,
@@ -784,47 +849,47 @@ candleProcessingQueue.process(async (job) => {
         // Update existing candle
         const currentCandle = existingCandle.rows[0];
 
-        const updateQuery = {
-          text: `
-            UPDATE ${tableName}
-            SET high = GREATEST(high, $1),
-                low = LEAST(low, $2),
-                close = $3
-            WHERE candlesize = $4
-            AND lots = $5
-            AND candletime = $6
-          `,
-          values: [
-            price,
-            price,
-            price,
-            timeframe,
-            lots,
-            candleTime.toISOString(),
-          ],
-        };
+        // const updateQuery = {
+        //   text: `
+        //     UPDATE ${tableName}
+        //     SET high = GREATEST(high, $1),
+        //         low = LEAST(low, $2),
+        //         close = $3
+        //     WHERE candlesize = $4
+        //     AND lots = $5
+        //     AND candletime = $6
+        //   `,
+        //   values: [
+        //     price,
+        //     price,
+        //     price,
+        //     timeframe,
+        //     lots,
+        //     candleTime.toISOString(),
+        //   ],
+        // };
 
-        await pgPool.query(updateQuery);
+        // await pgPool.query(updateQuery);
         // console.log(`Successfully updated candle in ${tableName}`);
       } else {
-        const insertQuery = {
-          text: `
-            INSERT INTO ${tableName}
-            (candlesize, lots, candletime, open, high, low, close)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-          `,
-          values: [
-            timeframe,
-            lots,
-            candleTime.toISOString(),
-            price, // open
-            price, // high (same as open for new candle)
-            price, // low (same as open for new candle)
-            price, // close (same as open for new candle)
-          ],
-        };
+        // const insertQuery = {
+        //   text: `
+        //     INSERT INTO ${tableName}
+        //     (candlesize, lots, candletime, open, high, low, close)
+        //     VALUES ($1, $2, $3, $4, $5, $6, $7)
+        //   `,
+        //   values: [
+        //     timeframe,
+        //     lots,
+        //     candleTime.toISOString(),
+        //     price, // open
+        //     price, // high (same as open for new candle)
+        //     price, // low (same as open for new candle)
+        //     price, // close (same as open for new candle)
+        //   ],
+        // };
 
-        await pgPool.query(insertQuery);
+        // await pgPool.query(insertQuery);
         // console.log(`Successfully inserted candle in ${tableName}`);
       }
     } catch (error) {
