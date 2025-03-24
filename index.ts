@@ -267,6 +267,56 @@ let availableCurrencyPairs: CurrencyPairInfo[] = [];
 // Track subscribed currency pairs
 const subscribedPairs: Set<string> = new Set();
 
+async function fetchCandlesFromDatabase(symbol: string, resolution: string): Promise<any[]> {
+  const tableName = `candles_${symbol.toLowerCase()}_bid`;
+  const query = {
+    text: `
+      SELECT candletime, open, high, low, close
+      FROM ${tableName}
+      WHERE candlesize = $1
+      ORDER BY candletime ASC
+    `,
+    values: [resolution],
+  };
+
+  try {
+    const result = await pgPool.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error(`Error fetching candles from database for ${symbol} (${resolution}):`, error);
+    throw error;
+  }
+}
+
+async function populateRedisWithCandles(symbol: string, resolution: string): Promise<void> {
+  try {
+    const candles = await fetchCandlesFromDatabase(symbol, resolution);
+    const redisKey = `${symbol}_${resolution}`;
+
+    for (const candle of candles) {
+      const candleepoch = Math.floor(new Date(candle.candletime).getTime() / 1000);
+      const record = JSON.stringify({
+        time: candleepoch,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+      });
+
+      await redisClient.zAdd(redisKey, [
+        {
+          score: candleepoch,
+          value: record,
+        },
+      ]);
+    }
+
+    console.log(`Populated Redis with ${candles.length} candles for ${symbol} (${resolution})`);
+  } catch (error) {
+    console.error(`Error populating Redis with candles for ${symbol} (${resolution}):`, error);
+    }
+}
+
 export const ensureCandleTableExists = async (
   tableName: string
 ): Promise<void> => {
@@ -341,6 +391,15 @@ const initDatabase = async () => {
   try {
     await fetchAllCurrencyPairs();
     await initCandleTables();
+
+    const resolutions = ["M1", "H1", "D1"]
+    for(const pair of availableCurrencyPairs){
+      for(const resolution of resolutions){
+        populateRedisWithCandles(pair.currpair, resolution)
+        console.log("Populate all the candles data from database to redis successfully");
+        
+      }
+    }
   } catch (error) {
     console.error("Error initializing database tables:", error);
   }
