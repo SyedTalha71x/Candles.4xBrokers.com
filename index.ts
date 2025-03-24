@@ -101,32 +101,83 @@ interface TickData {
 
 app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { symbol, resolution, startDate, endDate } = req.query;
+    let { symbol, fsym, tsym, resolution, startDate, endDate, limit, tt } = req.query;
 
-    if (!symbol || !resolution || !startDate || !endDate) {
-      res.status(400).json({ success: false, message: "Missing required query parameters." });
+    if (!symbol) {
+      if (!fsym || !tsym) {
+        res.status(400).json({ success: false, message: "Missing required query parameters: symbol or (fsym, tsym)" });
+        return;
+      }
+      symbol = `${fsym}${tsym}`;
+    }
+
+    const resolutionMap: Record<string, string> = {
+      "1M": "M1",
+      "1H": "H1",
+      "1D": "D1",
+    };
+    if (!resolution || !resolutionMap[resolution as string]) {
+      res.status(400).json({ success: false, message: "Invalid or missing resolution (Allowed: 1M, 1H, 1D)" });
+      return;
+    }
+    const candleSize = resolutionMap[resolution as string];
+
+    // Timestamp & Limit Handling
+    let startTimestamp = 0;
+    let endTimestamp = 0;
+    let fetchLimit = 0;
+
+    if (startDate && endDate) {
+      startTimestamp = Math.floor(new Date(startDate as string).getTime() / 1000);
+      endTimestamp = Math.floor(new Date(endDate as string).getTime() / 1000);
+      if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
+        res.status(400).json({ success: false, message: "Invalid date format. Use ISO format." });
+        return;
+      }
+    } else if (limit) {
+      fetchLimit = parseInt(limit as string);
+      if (isNaN(fetchLimit) || fetchLimit <= 0) {
+        res.status(400).json({ success: false, message: "Invalid limit value." });
+        return;
+      }
+    } else {
+      res.status(400).json({ success: false, message: "Either (startDate & endDate) or limit is required." });
       return;
     }
 
-    const startTimestamp = Math.floor(new Date(startDate as string).getTime() / 1000);
-    const endTimestamp = Math.floor(new Date(endDate as string).getTime() / 1000);
+    const redisKey = `${symbol}_${candleSize}`;
 
-    if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
-      res.status(400).json({ success: false, message: "Invalid date format. Use ISO format." });
-      return;
+    let candleData: string[];
+    if (fetchLimit > 0) {
+      candleData = await redisClient.zRange(redisKey as RedisCommandArgument, -fetchLimit, -1);
+    } else {
+      candleData = await redisClient.zRangeByScore(
+        redisKey as RedisCommandArgument,
+        startTimestamp.toString(),
+        endTimestamp.toString(),
+        { WITHSCORES: true } as ZRangeByScoreOptions
+      );
     }
 
-    const redisKey = `${symbol}_${resolution}`;
-    const candleData = await redisClient.zRangeByScore(
-      redisKey as RedisCommandArgument, 
-      startTimestamp.toString(), 
-      endTimestamp.toString(), 
-      { WITHSCORES: true } as ZRangeByScoreOptions
-    );
+    // Fetch Trader Type Markup
+    let markup = 0;
+    if (tt && ["R", "I", "S", "T"].includes(tt as string)) {
+      const markupKey = `markup_${symbol}_${tt}_B`;
+      const markupValue = await redisClient.get(markupKey);
+      if (markupValue) markup = parseFloat(markupValue);
+    }
 
+    // Parse Candlestick Data & Apply Markup
     const parsedCandles = candleData
       .map((value, index) => (index % 2 === 0 ? JSON.parse(value) : null))
-      .filter((value) => value !== null);
+      .filter((value) => value !== null)
+      .map((candle) => ({
+        ...candle,
+        open: parseFloat((candle.open - markup).toFixed(10)),
+        high: parseFloat((candle.high - markup).toFixed(10)),
+        low: parseFloat((candle.low - markup).toFixed(10)),
+        close: parseFloat((candle.close - markup).toFixed(10)),
+      }));
 
     res.status(200).json({ success: true, data: parsedCandles });
   } catch (error) {
@@ -134,6 +185,7 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
     res.status(500).json({ success: false, message: "Failed to fetch candle data" });
   }
 });
+
 
 app.listen(PORT, '0.0.0.0', ()=>{
   console.log(`Server is running ${PORT}`);
@@ -416,7 +468,6 @@ async function fetchMarkuplotsFromDatabase(): Promise<any[]> {
     throw error;
   }
 }
-
 
 const initCandleTables = async () => {
   try {
@@ -1309,9 +1360,12 @@ class FixClient {
         `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${this.reconnectDelay}ms...`
       );
   
+      // Ensure the socket is properly destroyed before reconnecting
+      if (this.client && !this.client.destroyed) {
+        this.client.destroy();
+      }
+  
       // Reinitialize the FIX client
-      this.client.removeAllListeners();
-      this.client.destroy();
       this.initializeClient();
   
       // Ensure Redis is connected
@@ -1322,10 +1376,10 @@ class FixClient {
           console.log("Successfully reconnected to Redis");
         } catch (err) {
           console.error("Failed to reconnect to Redis:", err);
-          // Continue with reconnection attempt despite Redis failure
         }
       }
   
+      // Attempt to reconnect to the FIX server
       reconnectTimeout = setTimeout(() => {
         this.connect();
       }, this.reconnectDelay);
