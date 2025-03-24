@@ -116,12 +116,14 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
       "1H": "H1",
       "1D": "D1",
     };
+
     if (!resolution || !resolutionMap[resolution as string]) {
       res.status(400).json({ success: false, message: "Invalid or missing resolution (Allowed: 1M, 1H, 1D)" });
       return;
     }
     const candleSize = resolutionMap[resolution as string];
-
+    // console.log(candleSize, "candle size ------");
+    
     // Timestamp & Limit Handling
     let startTimestamp = 0;
     let endTimestamp = 0;
@@ -1146,17 +1148,17 @@ class FixClient {
     const messages = this.extractMessages();
 
     for (const message of messages) {
-      console.log("RAW MESSAGE RECEIVED:", message);
+      // console.log("RAW MESSAGE RECEIVED:", message);
 
       const parsed = this.parseFixMessage(message);
-      this.logParsedMessage(parsed, "Received");
+      // this.logParsedMessage(parsed, "Received");
 
       // Process market data messages
       if (
         parsed.messageType === "Market Data Snapshot" ||
         parsed.messageType === "Market Data Incremental Refresh"
       ) {
-        console.log("Received market data response!");
+        // console.log("Received market data response!");
 
         try {
           // Extract market data entries
