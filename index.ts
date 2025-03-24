@@ -324,9 +324,9 @@ async function populateRedisWithMarkuplots(): Promise<void> {
     for (const row of markuplotsData) {
       const { currpair, tradertype, decimals, mu_b, mu_a } = row;
 
-      // Round the values to the specified number of decimals
-      const markuppipsBid = parseFloat(mu_b.toFixed(decimals));
-      const markuppipsAsk = parseFloat(mu_a.toFixed(decimals));
+      // Ensure mu_b and mu_a are numbers
+      const markuppipsBid = typeof mu_b === 'number' ? parseFloat(mu_b.toFixed(decimals)) : 0;
+      const markuppipsAsk = typeof mu_a === 'number' ? parseFloat(mu_a.toFixed(decimals)) : 0;
 
       // Create Redis keys
       const redisKeyBid = `markup_${currpair}_${tradertype}_B`;
