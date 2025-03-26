@@ -1,6 +1,6 @@
 {
     "compilerOptions": {
-        "target": "es2017",
+        "target": "ES6",
         "module": "NodeNext",
         "moduleResolution": "nodenext",
         "strict": false,
@@ -9,8 +9,6 @@
         "forceConsistentCasingInFileNames": true,
         "outDir": "./dist",
         "resolveJsonModule": true,
-        "noEmit": true,
-        "allowImportingTsExtensions":true
     },
     "exclude": [
         "dist",
