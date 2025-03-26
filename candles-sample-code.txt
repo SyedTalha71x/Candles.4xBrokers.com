@@ -1492,3 +1492,12 @@ process.on("SIGINT", async () => {
     process.exit(0);
   });
 });
+
+
+
+{symbol: "GBPNZD", p: 2.25659, ts: 1742898520000, lots: 7, bora: "B"}
+bora: "B"
+lots: 7
+p: 2.25659
+symbol: "GBPNZD"
+ts: 1742898520000

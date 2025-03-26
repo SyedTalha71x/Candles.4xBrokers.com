@@ -1,0 +1,1012 @@
+import pkg from "pg";
+const { Pool } = pkg;
+import Bull from "bull";
+import { configDotenv } from "dotenv";
+import { createClient } from "redis";
+import express from "express";
+import type { Request, Response } from "express";
+import { Server } from "socket.io";
+import WebSocket from "ws";
+import { createServer } from "http";
+import { RedisCommandArgument } from "@redis/client/dist/lib/commands/index.js";
+import { ZRangeByScoreOptions } from "@redis/client/dist/lib/commands/ZRANGEBYSCORE.js";
+
+const app = express();
+const server = createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+const PORT = 3000; 
+
+app.use(express.json());
+configDotenv();
+
+// WebSocket connection details
+const WS_HOST = process.env.WS_HOST || "50.19.20.84";
+const WS_PORT = parseInt(process.env.WS_PORT || "8081");
+
+// Database configuration
+const PG_HOST = process.env.PG_HOST;
+const PG_PORT = process.env.PG_PORT;
+const PG_USER = process.env.PG_USER;
+const PG_PASSWORD = process.env.PG_PASSWORD;
+const PG_DATABASE = process.env.PG_DATABASE;
+
+// Redis configuration
+const REDIS_HOST = process.env.REDIS_HOST || "localhost";
+const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
+
+// Initialize Redis client
+const redisClient = createClient({
+  url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
+  socket: {
+    reconnectStrategy: (retries) => {
+      const delay = Math.min(retries * 50, 2000);
+      console.log(`Redis reconnecting, attempt ${retries}, next try in ${delay}ms`);
+      return delay;
+    }
+  }
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+
+redisClient.connect()
+  .then(() => {
+    console.log("Connected to Redis");
+    setupRedisHealthCheck();
+  })
+  .catch((err) => {
+    console.error("Failed to connect to Redis:", err);
+  });
+
+const pgPool = new Pool({
+  host: PG_HOST,
+  port: PG_PORT ? Number(PG_PORT) : 5432,
+  user: PG_USER,
+  password: PG_PASSWORD,
+  database: PG_DATABASE,
+});
+
+const timeFrames = {
+  M1: 60000,    // 1 minute
+  H1: 3600000,  // 1 hour
+  D1: 86400000  // 1 day
+};
+
+const marketDataQueue = new Bull("marketData", {
+  redis: {
+    host: REDIS_HOST,
+    port: REDIS_PORT,
+  },
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: "exponential",
+      delay: 1000,
+    },
+    removeOnComplete: true,
+    timeout: 30000,
+  }
+});
+
+const candleProcessingQueue = new Bull("candleProcessing", {
+  redis: {
+    host: REDIS_HOST,
+    port: REDIS_PORT,
+  },
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: "exponential",
+      delay: 1000,
+    },
+    removeOnComplete: true,
+    timeout: 30000,
+  }
+});
+
+// Interfaces
+interface TickData {
+  symbol: string;
+  price: number;
+  timestamp: number;
+  lots: number;
+  bora: 'B' | 'A';
+}
+
+interface CandleData {
+  symbol: string;
+  timeframe: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  timestamp: Date;
+  lots: number;
+}
+
+interface CurrencyPairInfo {
+  currpair: string;
+  contractsize: number | null;
+}
+
+// Global variables
+let availableCurrencyPairs: CurrencyPairInfo[] = [];
+const subscribedPairs: Set<string> = new Set();
+
+app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
+  try {
+    let { symbol, fsym, tsym, resolution, startDate, endDate, limit, tt } = req.query;
+
+    if (!symbol) {
+      if (!fsym || !tsym) {
+        res.status(400).json({ success: false, message: "Missing required query parameters: symbol or (fsym, tsym)" });
+        return;
+      }
+      symbol = `${fsym}${tsym}`;
+    }
+
+    const resolutionMap: Record<string, string> = {
+      "1M": "M1",
+      "1H": "H1",
+      "1D": "D1",
+    };
+
+    if (!resolution || !resolutionMap[resolution as string]) {
+      res.status(400).json({ success: false, message: "Invalid or missing resolution (Allowed: 1M, 1H, 1D)" });
+      return;
+    }
+    const candleSize = resolutionMap[resolution as string];
+    
+    // Timestamp & Limit Handling
+    let startTimestamp = 0;
+    let endTimestamp = 0;
+    let fetchLimit = 0;
+
+    if (startDate && endDate) {
+      startTimestamp = Math.floor(new Date(startDate as string).getTime() / 1000);
+      endTimestamp = Math.floor(new Date(endDate as string).getTime() / 1000);
+      if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
+        res.status(400).json({ success: false, message: "Invalid date format. Use ISO format." });
+        return;
+      }
+    } else if (limit) {
+      fetchLimit = parseInt(limit as string);
+      if (isNaN(fetchLimit) || fetchLimit <= 0) {
+        res.status(400).json({ success: false, message: "Invalid limit value." });
+        return;
+      }
+    } else {
+      res.status(400).json({ success: false, message: "Either (startDate & endDate) or limit is required." });
+      return;
+    }
+
+    const redisKey = `${symbol}_${candleSize}`;
+
+    let candleData: string[];
+    if (fetchLimit > 0) {
+      candleData = await redisClient.zRange(redisKey as RedisCommandArgument, -fetchLimit, -1);
+    } else {
+      candleData = await redisClient.zRangeByScore(
+        redisKey as RedisCommandArgument,
+        startTimestamp.toString(),
+        endTimestamp.toString(),
+        { WITHSCORES: true } as ZRangeByScoreOptions
+      );
+    }
+
+    // Fetch Trader Type Markup
+    let markup = 0;
+    if (tt && ["R", "I", "S", "T"].includes(tt as string)) {
+      const markupKey = `markup_${symbol}_${tt}_B`;
+      const markupValue = await redisClient.get(markupKey);
+      if (markupValue) markup = parseFloat(markupValue);
+    }
+
+    // Parse Candlestick Data & Apply Markup
+    const parsedCandles = candleData
+      .map((value, index) => (index % 2 === 0 ? JSON.parse(value) : null))
+      .filter((value) => value !== null)
+      .map((candle) => ({
+        ...candle,
+        open: parseFloat((candle.open - markup).toFixed(10)),
+        high: parseFloat((candle.high - markup).toFixed(10)),
+        low: parseFloat((candle.low - markup).toFixed(10)),
+        close: parseFloat((candle.close - markup).toFixed(10)),
+      }));
+
+    res.status(200).json({ success: true, data: parsedCandles });
+  } catch (error) {
+    console.error("Error fetching candle data:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch candle data" });
+  }
+});
+
+let marketDataSocket: WebSocket | null = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY = 5000; // 5 seconds
+let isWebSocketConnected = false;
+let pingInterval: NodeJS.Timeout;
+let connectionTimeout: NodeJS.Timeout;
+
+function connectToMarketDataWebSocket() {
+  // Clear any existing connection
+  if (marketDataSocket) {
+    marketDataSocket.removeAllListeners();
+    marketDataSocket.close();
+    marketDataSocket = null;
+  }
+
+  // Clear any existing intervals/timeouts
+  clearInterval(pingInterval);
+  clearTimeout(connectionTimeout);
+
+  const wsUrl = `ws://${WS_HOST}:${WS_PORT}`;
+  console.log(`Connecting to market data WebSocket at ${wsUrl}`);
+
+  // Set connection timeout (10 seconds)
+  connectionTimeout = setTimeout(() => {
+    if (marketDataSocket?.readyState === WebSocket.CONNECTING) {
+      console.log('WebSocket connection timeout');
+      marketDataSocket.close();
+    }
+  }, 10000);
+
+  marketDataSocket = new WebSocket(wsUrl);
+
+  marketDataSocket.on('open', () => {
+    clearTimeout(connectionTimeout);
+    isWebSocketConnected = true;
+    reconnectAttempts = 0;
+    console.log('Connected to market data WebSocket server');
+    
+    // Set up ping/pong keepalive
+    pingInterval = setInterval(() => {
+      if (marketDataSocket?.readyState === WebSocket.OPEN) {
+        marketDataSocket.ping();
+      }
+    }, 30000); // Send ping every 30 seconds
+
+    // Subscribe to all available pairs
+    const pairsToSubscribe = availableCurrencyPairs
+      .filter(pair => pair.contractsize !== null)
+      .map(pair => pair.currpair);
+
+    if (pairsToSubscribe.length > 0) {
+      const subscribeMessage = {
+        action: 'SubAdd',
+        subs: pairsToSubscribe.map(pair => `0~${pair}`)
+      };
+      marketDataSocket.send(JSON.stringify(subscribeMessage));
+      console.log('Subscribed to currency pairs:', pairsToSubscribe.join(', '));
+    }
+  });
+
+  marketDataSocket.on('close', (code, reason) => {
+    clearInterval(pingInterval);
+    isWebSocketConnected = false;
+    console.log(`Disconnected from market data WebSocket server. Code: ${code}, Reason: ${reason.toString()}`);
+    
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++;
+      console.log(`Attempting to reconnect (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) in ${RECONNECT_DELAY/1000} seconds...`);
+      setTimeout(connectToMarketDataWebSocket, RECONNECT_DELAY);
+    } else {
+      console.error('Max reconnection attempts reached. Giving up.');
+    }
+  });
+
+  marketDataSocket.on('error', (error) => {
+    console.error('WebSocket error:', error);
+    isWebSocketConnected = false;
+  });
+
+  marketDataSocket.on('pong', () => {
+    console.debug('Received pong from server');
+  });
+
+  marketDataSocket.on('message', (data) => {
+    try {
+      const tickData: TickData = JSON.parse(data.toString());
+      console.debug('Received tick data:', tickData);
+      
+      // Process incoming tick data
+      processIncomingTick(tickData);
+    } catch (error) {
+      console.error('Error processing WebSocket message:', error);
+    }
+  });
+}
+
+// Connection health check
+function checkWebSocketConnection() {
+  if (!isWebSocketConnected) {
+    console.log('WebSocket is not connected, attempting to reconnect...');
+    connectToMarketDataWebSocket();
+  }
+}
+
+// Set up periodic connection check (every 30 seconds)
+const connectionCheckInterval = setInterval(checkWebSocketConnection, 30000);
+
+// Cleanup function
+function cleanupWebSocketConnection() {
+  clearInterval(connectionCheckInterval);
+  clearInterval(pingInterval);
+  clearTimeout(connectionTimeout);
+  
+  if (marketDataSocket) {
+    marketDataSocket.removeAllListeners();
+    marketDataSocket.close();
+    marketDataSocket = null;
+  }
+}
+
+function processIncomingTick(tickData: TickData) {
+  const { symbol, price, timestamp, lots, bora } = tickData;
+  
+  marketDataQueue.add({
+    symbol,
+    price,
+    timestamp: new Date(timestamp),
+    lots,
+    type: bora === 'B' ? 'BID' : 'ASK'
+  });
+
+  if (bora === 'B') {
+    processTickForCandles({
+      symbol,
+      price,
+      timestamp,
+      lots,
+      bora
+    });
+  }
+}
+
+async function populateRedisWithHistoricalCandles() {
+  try {
+    const resolutions = ["M1", "H1", "D1"];
+    
+    for (const pair of availableCurrencyPairs) {
+      if (pair.contractsize === null) continue;
+      
+      const symbol = pair.currpair;
+      const tableName = `candles_${symbol.toLowerCase()}_bid`;
+      
+      // Check if table exists
+      const tableExists = await pgPool.query(
+        `SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        )`,
+        [tableName]
+      );
+      
+      if (!tableExists.rows[0].exists) continue;
+      
+      // Load candles for each resolution
+      for (const resolution of resolutions) {
+        const candles = await pgPool.query(
+          `SELECT candletime, open, high, low, close 
+           FROM ${tableName} 
+           WHERE candlesize = $1 
+           ORDER BY candletime`,
+          [resolution]
+        );
+        
+        const redisKey = `${symbol}_${resolution}`;
+        
+        // Clear existing data for this symbol/resolution
+        await redisClient.del(redisKey);
+        
+        // Add all candles to Redis
+        for (const candle of candles.rows) {
+          const candleepoch = Math.floor(candle.candletime.getTime() / 1000);
+          const record = JSON.stringify({
+            time: candleepoch,
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close
+          });
+          
+          await redisClient.zAdd(redisKey, [
+            {
+              score: candleepoch,
+              value: record
+            }
+          ]);
+        }
+        
+        console.log(`Loaded ${candles.rows.length} ${resolution} candles for ${symbol} into Redis`);
+      }
+    }
+  } catch (error) {
+    console.error("Error populating Redis with historical candles:", error);
+  }
+}
+
+async function processTickForCandles(tickData: TickData) {
+  try {
+    await candleProcessingQueue.add({
+      tickData,
+      timeFrames: Object.keys(timeFrames)
+    }, {
+      jobId: `candle_${tickData.symbol}_${Date.now()}`
+    });
+  } catch (error) {
+    console.error("Error adding tick to candle processing queue:", error);
+  }
+}
+
+async function initDatabase() {
+  try {
+    await redisClient.flushDb();
+    console.log("Redis flushed, starting fresh initialization");
+
+
+    await fetchAllCurrencyPairs();
+    await populateRedisWithMarkuplots();
+    await populateRedisWithHistoricalCandles();
+    await populateRedisWithHistoricalTicks();
+    console.log("Database initialization complete with candles and markups lots in redis");
+  } catch (error) {
+    console.error("Error initializing database:", error);
+  }
+}
+
+async function populateRedisWithHistoricalTicks() {
+  try {
+    for (const pair of availableCurrencyPairs) {
+      if (pair.contractsize === null) continue;
+      
+      const symbol = pair.currpair;
+      const bidTableName = `ticks_${symbol.toLowerCase()}_bid`;
+      const askTableName = `ticks_${symbol.toLowerCase()}_ask`;
+      
+      const bidTableExists = await pgPool.query(
+        `SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        )`,
+        [bidTableName]
+      );
+      
+      const askTableExists = await pgPool.query(
+        `SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        )`,
+        [askTableName]
+      );
+      
+      if (bidTableExists.rows[0].exists) {
+        const ticks = await pgPool.query(
+          `SELECT ticktime, lots, price 
+           FROM ${bidTableName} 
+           ORDER BY ticktime DESC`
+        );
+        
+        const redisKey = `ticks_${symbol}_BID`;
+        await redisClient.del(redisKey);
+        
+        for (const tick of ticks.rows) {
+          const tickData = {
+            time: Math.floor(tick.ticktime.getTime() / 1000),
+            price: tick.price,
+            lots: tick.lots
+          };
+          
+          await redisClient.zAdd(redisKey, {
+            score: tickData.time,
+            value: JSON.stringify(tickData)
+          });
+        }
+        
+        console.log(`Loaded ${ticks.rows.length} BID ticks for ${symbol} into Redis`);
+      }
+      
+      if (askTableExists.rows[0].exists) {
+        const ticks = await pgPool.query(
+          `SELECT ticktime, lots, price 
+           FROM ${askTableName} 
+           ORDER BY ticktime DESC` 
+        );
+        
+        const redisKey = `ticks_${symbol}_ASK`;
+        await redisClient.del(redisKey);
+        
+        for (const tick of ticks.rows) {
+          const tickData = {
+            time: Math.floor(tick.ticktime.getTime() / 1000),
+            price: tick.price,
+            lots: tick.lots
+          };
+          
+          await redisClient.zAdd(redisKey, {
+            score: tickData.time,
+            value: JSON.stringify(tickData)
+          });
+        }
+        
+        console.log(`Loaded ${ticks.rows.length} ASK ticks for ${symbol} into Redis`);
+      }
+    }
+  } catch (error) {
+    console.error("Error populating Redis with historical ticks:", error);
+  }
+}
+
+async function fetchAllCurrencyPairs() {
+  try {
+    const result = await pgPool.query(
+      "SELECT currpair, contractsize FROM currpairdetails"
+    );
+    availableCurrencyPairs = result.rows;
+
+    const validPairs = availableCurrencyPairs.filter(
+      (pair) => pair.contractsize !== null
+    );
+    const invalidPairs = availableCurrencyPairs.filter(
+      (pair) => pair.contractsize === null
+    );
+
+    if (invalidPairs.length > 0) {
+      console.log(
+        "Skipping subscription for the following pairs due to null contract size:"
+      );
+      invalidPairs.forEach((pair) => console.log(`- ${pair.currpair}`));
+    }
+
+    // Add valid pairs to subscribed set
+    validPairs.forEach((pair) => {
+      subscribedPairs.add(pair.currpair);
+    });
+  } catch (error) {
+    console.error("Error fetching currency pairs:", error);
+  }
+}
+
+async function populateRedisWithMarkuplots() {
+  try {
+    const markuplotsData = await fetchMarkuplotsFromDatabase();
+
+    for (const row of markuplotsData) {
+      const { currpair, tradertype, decimals, mu_b, mu_a } = row;
+
+      const markuppipsBid = typeof mu_b === 'number' ? parseFloat(mu_b.toFixed(decimals)) : 0;
+      const markuppipsAsk = typeof mu_a === 'number' ? parseFloat(mu_a.toFixed(decimals)) : 0;
+
+      const redisKeyBid = `markup_${currpair}_${tradertype}_B`;
+      const redisKeyAsk = `markup_${currpair}_${tradertype}_A`;
+
+      await redisClient.set(redisKeyBid, markuppipsBid);
+      await redisClient.set(redisKeyAsk, markuppipsAsk);
+
+      console.log(`Stored markuplots for ${currpair} (${tradertype}): Bid=${markuppipsBid}, Ask=${markuppipsAsk}`);
+    }
+
+    console.log("Successfully populated Redis with markuplots data");
+  } catch (error) {
+    console.error("Error populating Redis with markuplots data:", error);
+  }
+}
+
+async function fetchMarkuplotsFromDatabase() {
+  const query = `
+    WITH cpd AS (
+      SELECT currpair, pointsperunit, decimals, 
+             ROW_NUMBER() OVER (PARTITION BY currpair ORDER BY effdate DESC) AS rn 
+      FROM currpairdetails 
+      WHERE effdate <= NOW()
+    ),
+    mul AS (
+      SELECT currpair, tradertype, markuppips_bid, markuppips_ask, 
+             ROW_NUMBER() OVER (PARTITION BY currpair, tradertype ORDER BY effdate DESC) AS rn 
+      FROM markuplots 
+      WHERE effdate <= NOW()
+    )
+    SELECT mul.currpair, mul.tradertype, decimals, 
+           10 * markuppips_bid / pointsperunit AS mu_b, 
+           10 * markuppips_ask / pointsperunit AS mu_a
+    FROM cpd, mul
+    WHERE cpd.currpair = mul.currpair
+      AND cpd.rn = 1
+      AND mul.rn = 1
+    ORDER BY mul.currpair, mul.tradertype;
+  `;
+
+  try {
+    const result = await pgPool.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error("Error fetching markuplots data from database:", error);
+    throw error;
+  }
+}
+
+async function processTick(tickData) {
+  const { currpair, lots, price, tickepoch } = tickData;
+
+  const resolutions = ["M1", "H1", "D1"];
+
+  for (const resolution of resolutions) {
+    await processTickResolution(currpair, lots, price, tickepoch, resolution);
+  }
+}
+
+async function storeTickInDatabase(
+  symbol: string, 
+  lots: number, 
+  price: number, 
+  timestamp: Date,
+  type: 'BID' | 'ASK'
+) {
+  try {
+    const tableName = `ticks_${symbol.toLowerCase()}_${type.toLowerCase()}`;
+    
+    // Ensure the ticks table exists
+    await ensureTicksTableExists(tableName);
+
+    // Insert tick data
+    const query = {
+      text: `
+        INSERT INTO ${tableName} (ticktime, lots, price)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (lots) DO NOTHING;
+      `,
+      values: [timestamp, lots, price]
+    };
+
+    await pgPool.query(query);
+    console.log(`Stored ${type} tick for ${symbol} at ${timestamp}`);
+  } catch (error) {
+    console.error(`Error storing ${type} tick for ${symbol}:`, error);
+    throw error;
+  }
+}
+
+async function processTickResolution(
+  currpair: string,
+  lots: number,
+  price: number,
+  tickepoch: number,
+  resolution: string
+) {
+  const redisKey = `${currpair}_${resolution}`;
+  const candletime = new Date(tickepoch * 1000);
+
+  // Calculate candle time based on resolution
+  let floor;
+  switch (resolution) {
+    case "M1":
+      floor = Math.floor(tickepoch / 60) * 60;
+      candletime.setSeconds(0, 0);
+      break;
+    case "H1":
+      floor = Math.floor(tickepoch / 3600) * 3600;
+      candletime.setMinutes(0, 0, 0);
+      break;
+    case "D1":
+      const date = new Date(tickepoch * 1000);
+      floor = new Date(
+        date.getUTCFullYear(),
+        date.getUTCMonth(),
+        date.getUTCDate()
+      ).getTime() / 1000;
+      candletime.setUTCHours(0, 0, 0, 0);
+      break;
+    default:
+      return;
+  }
+
+  // Check if candle exists in Redis
+  const existingCandle = await redisClient.zRangeByScore(redisKey, floor, floor);
+
+  let candleData;
+  if (existingCandle.length > 0) {
+    // Update existing candle
+    candleData = JSON.parse(existingCandle[0]);
+    candleData.close = price;
+    candleData.high = Math.max(candleData.high, price);
+    candleData.low = Math.min(candleData.low, price);
+  } else {
+    // Create new candle
+    candleData = {
+      time: floor,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+    };
+  }
+
+  // Update Redis
+  await addRedisRecord(redisKey, candleData, existingCandle.length > 0);
+
+  // Store candle in database
+  await storeCandleInDatabase({
+    symbol: currpair,
+    timeframe: resolution,
+    open: candleData.open,
+    high: candleData.high,
+    low: candleData.low,
+    close: candleData.close,
+    timestamp: new Date(floor * 1000),
+    lots: lots
+  });
+}
+
+async function storeCandleInDatabase(candle: {
+  symbol: string;
+  timeframe: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  timestamp: Date;
+  lots: number;
+}) {
+  try {
+    const tableName = `candles_${candle.symbol.toLowerCase()}_bid`;
+    
+    // Ensure the candles table exists
+    await ensureCandlesTableExists(tableName);
+
+    // Insert or update candle data
+    const query = {
+      text: `
+        INSERT INTO ${tableName} 
+          (candlesize, candletime, open, high, low, close, lots)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (candlesize, candletime) 
+        DO UPDATE SET 
+          high = GREATEST(${tableName}.high, EXCLUDED.high),
+          low = LEAST(${tableName}.low, EXCLUDED.low),
+          close = EXCLUDED.close
+      `,
+      values: [
+        candle.timeframe,
+        candle.timestamp,
+        candle.open,
+        candle.high,
+        candle.low,
+        candle.close,
+        candle.lots
+      ]
+    };
+
+    await pgPool.query(query);
+    console.log(`Stored ${candle.timeframe} candle for ${candle.symbol} at ${candle.timestamp}`);
+  } catch (error) {
+    console.error(`Error storing candle for ${candle.symbol}:`, error);
+    throw error;
+  }
+}
+
+async function ensureTicksTableExists(tableName: string) {
+  try {
+    const tableCheck = await pgPool.query(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = $1
+      )`,
+      [tableName]
+    );
+
+    if (!tableCheck.rows[0].exists) {
+      await pgPool.query(`
+        CREATE TABLE ${tableName} (
+          ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
+          lots INTEGER NOT NULL,
+          price NUMERIC NOT NULL,
+          PRIMARY KEY (ticktime, lots)
+        )
+      `);
+      console.log(`Created ticks table ${tableName}`);
+      
+      // Add index for better query performance
+      await pgPool.query(`CREATE INDEX idx_${tableName}_time ON ${tableName} (ticktime)`);
+    }
+  } catch (error) {
+    console.error(`Error ensuring ticks table ${tableName} exists:`, error);
+    throw error;
+  }
+}
+
+async function ensureCandlesTableExists(tableName: string) {
+  try {
+    const tableCheck = await pgPool.query(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = $1
+      )`,
+      [tableName]
+    );
+
+    if (!tableCheck.rows[0].exists) {
+      await pgPool.query(`
+        CREATE TABLE ${tableName} (
+          candlesize TEXT NOT NULL,
+          candletime TIMESTAMP WITH TIME ZONE NOT NULL,
+          open NUMERIC(12,5) NOT NULL,
+          high NUMERIC(12,5) NOT NULL,
+          low NUMERIC(12,5) NOT NULL,
+          close NUMERIC(12,5) NOT NULL,
+          lots SMALLINT NOT NULL,
+          PRIMARY KEY (candlesize, candletime)
+        )
+      `);
+      console.log(`Created candles table ${tableName}`);
+      
+      // Add indexes for better query performance
+      await pgPool.query(`CREATE INDEX idx_${tableName}_time ON ${tableName} (candletime)`);
+      await pgPool.query(`CREATE INDEX idx_${tableName}_size ON ${tableName} (candlesize)`);
+    }
+  } catch (error) {
+    console.error(`Error ensuring candles table ${tableName} exists:`, error);
+    throw error;
+  }
+}
+
+marketDataQueue.process(5, async (job) => {
+  try {
+    const { symbol, price, timestamp, lots, type } = job.data;
+    
+    // Store tick data in database
+    await storeTickInDatabase(symbol, lots, price, timestamp, type);
+    
+    // Process tick for candle generation (only for BID prices)
+    if (type === 'BID') {
+      await processTick({
+        currpair: symbol,
+        lots: lots,
+        price: price,
+        tickepoch: Math.floor(timestamp.getTime() / 1000)
+      });
+    }
+
+    return { success: true, symbol, type };
+  } catch (error) {
+    console.error(`Error processing market data job:`, error);
+    throw error;
+  }
+});
+
+candleProcessingQueue.process(async (job) => {
+  const { tickData, timeFrames } = job.data;
+  const { symbol, price, timestamp } = tickData;
+
+  const tickepoch = Math.floor(timestamp.getTime() / 1000);
+
+  for (const timeframe of Object.keys(timeFrames)) {
+    try {
+      await processTickResolution(
+        symbol,
+        1, // lots
+        price,
+        tickepoch,
+        timeframe
+      );
+    } catch (error) {
+      console.error(`Error processing ${timeframe} candle for ${symbol}:`, error);
+      throw error;
+    }
+  }
+
+  return { success: true, symbol };
+});
+
+async function addRedisRecord(
+  redisKey: string,
+  candleData: any,
+  deleteExisting = false
+) {
+  try {
+    if (deleteExisting) {
+      const score = Number(candleData.candleepoch);
+      await redisClient.zRemRangeByScore(redisKey, score, score);
+    }
+
+    const score = Number(candleData.candleepoch);
+    const record = JSON.stringify({
+      time: candleData.candleepoch,
+      open: candleData.open,
+      high: candleData.high,
+      low: candleData.low,
+      close: candleData.close,
+    });
+
+    await redisClient.zAdd(redisKey, [
+      {
+        score: score,
+        value: record,
+      },
+    ]);
+  } catch (error) {
+    console.error(`Error adding/updating Redis record for ${redisKey}:`, error);
+  }
+}
+
+function setupRedisHealthCheck() {
+  const HEALTH_CHECK_INTERVAL = 30000;
+  
+  setInterval(async () => {
+    try {
+      if (!redisClient.isOpen) {
+        console.log("Redis connection is down, attempting to reconnect...");
+        await redisClient.connect();
+        console.log("Redis connection restored");
+      } else {
+        await redisClient.ping();
+      }
+    } catch (error) {
+      console.error("Redis health check failed:", error);
+      
+      try {
+        if (redisClient.isOpen) {
+          await redisClient.disconnect();
+        }
+        await redisClient.connect();
+        console.log("Redis connection restored after forced reconnection");
+      } catch (reconnectError) {
+        console.error("Failed to restore Redis connection:", reconnectError);
+      }
+    }
+  }, HEALTH_CHECK_INTERVAL);
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server is running on port ${PORT}`);
+  
+  initDatabase().then(() => {
+    connectToMarketDataWebSocket();
+  });
+});
+
+process.on("SIGINT", async () => {
+  console.log("Shutting down...");
+
+  cleanupWebSocketConnection();
+  
+  console.log("Closing Bull queues...");
+  await marketDataQueue.close();
+  await candleProcessingQueue.close();
+
+  console.log("Closing Redis connection...");
+  await redisClient.quit();
+
+  console.log("Closing database connection...");
+  await pgPool.end();
+
+  process.exit(0);
+});
+
+// Queue event handlers
+marketDataQueue.on("completed", (job, result) => {
+  console.log(`Market data job completed: ${result.symbol} ${result.type}`);
+});
+
+marketDataQueue.on("failed", (job, error) => {
+  console.error(`Market data job failed:`, error);
+});
+
+candleProcessingQueue.on("completed", (job, result) => {
+  console.log(`Candle processing job completed: ${result.symbol}`);
+});
+
+candleProcessingQueue.on("failed", (job, error) => {
+  console.error(`Candle processing job failed:`, error);
+});
