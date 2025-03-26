@@ -115,7 +115,7 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
     const redisKey = `${symbol}_${candleSize}`;
     const tableName = `candles_${symbol.toLowerCase()}_bid`;
 
-    console.log('Parameters parsed:', { symbol, candleSize, to, from, fetchLimit }); // Log parsed params
+    console.log('Parameters parsed:', { symbol, candleSize, to, from, fetchLimit }); 
 
     // Function to fetch candles from database (using PHP-style parameterized queries)
     const fetchFromDatabase = async () => {
@@ -217,6 +217,7 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
             })
           });
         });
+        
         await pipeline.exec();
 
         console.log(`Loaded ${dbCandles.length} candles into Redis for ${redisKey}`);

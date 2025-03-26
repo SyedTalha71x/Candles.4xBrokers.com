@@ -1428,3 +1428,253 @@ Parameters parsed: {
 Executing database query...
 Database query completed, rows: 2000
 Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742981859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742891859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742801859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742711859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742621859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742531859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742441859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742351859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742261859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742171859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742081859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1741991859,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742983875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742893875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742803875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742713875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742623875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742533875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742443875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742353875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742263875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742173875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742083875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1741993875,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
+Parameters parsed: {
+  symbol: 'USDCAD',
+  candleSize: 'M1',
+  to: 1742903328,
+  from: 0,
+  fetchLimit: 2000
+}
+Executing database query...
+Database query completed, rows: 2000
+Loaded 2000 candles into Redis for USDCAD_M1
