@@ -61,17 +61,20 @@ const isRedisConnected = () => redisClient.isReady || redisClient.isOpen;
 
 app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
   console.log("Entered in the api route");
-  
+
   try {
     const { symbol: symbolParam, fsym: fsymParam, tsym: tsymParam, resolution, toTs, frTs, limit, tt } = req.query;
 
     let symbol: string;
-    if (typeof symbolParam === 'string') {
-      symbol = symbolParam;
-    } else if (!symbolParam && typeof fsymParam === 'string' && typeof tsymParam === 'string') {
+
+    if (fsymParam !== "null" && tsymParam !== "null") {
       symbol = `${fsymParam}${tsymParam}`;
+      console.log(fsymParam === 'string' && !tsymParam, fsymParam, tsymParam);
+
+    } else if (fsymParam !== "null" && tsymParam == "null") {
+      symbol = fsymParam.toString();
     } else {
-      res.status(400).json({ success: false, message: "Invalid symbol parameters" });
+      res.status(500).json({ success: false, message: "Invalid symbol parameters" });
       return;
     }
 
@@ -115,7 +118,7 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
     const redisKey = `${symbol}_${candleSize}`;
     const tableName = `candles_${symbol.toLowerCase()}_bid`;
 
-    console.log('Parameters parsed:', { symbol, candleSize, to, from, fetchLimit }); 
+    console.log('Parameters parsed:', { symbol, candleSize, to, from, fetchLimit });
 
     // Function to fetch candles from database (using PHP-style parameterized queries)
     const fetchFromDatabase = async () => {
@@ -200,40 +203,40 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
     // }
 
     // Fallback to database if Redis fails
-      try {
-        const dbCandles = await fetchFromDatabase();
+    try {
+      const dbCandles = await fetchFromDatabase();
 
-        // Store in Redis for future requests
-        const pipeline = redisClient.multi();
-        dbCandles.forEach(candle => {
-          pipeline.zAdd(redisKey, {
-            score: candle.timestamp,
-            value: JSON.stringify({
-              time: candle.timestamp,
-              open: candle.open,
-              high: candle.high,
-              low: candle.low,
-              close: candle.close
-            })
-          });
+      // Store in Redis for future requests
+      const pipeline = redisClient.multi();
+      dbCandles.forEach(candle => {
+        pipeline.zAdd(redisKey, {
+          score: candle.timestamp,
+          value: JSON.stringify({
+            time: candle.timestamp,
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close
+          })
         });
-        
-        await pipeline.exec();
+      });
 
-        console.log(`Loaded ${dbCandles.length} candles into Redis for ${redisKey}`);
-        candleData = dbCandles.map(candle => JSON.stringify({
-          time: candle.timestamp,
-          open: candle.open,
-          high: candle.high,
-          low: candle.low,
-          close: candle.close
-        }));
-      } catch (dbError) {
-        console.error("Failed to fetch from database:", dbError);
-        res.status(500).json({ success: false, message: "Failed to fetch candle data" });
-        return;
-      }
-    
+      await pipeline.exec();
+
+      console.log(`Loaded ${dbCandles.length} candles into Redis for ${redisKey}`);
+      candleData = dbCandles.map(candle => JSON.stringify({
+        time: candle.timestamp,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close
+      }));
+    } catch (dbError) {
+      console.error("Failed to fetch from database:", dbError);
+      res.status(500).json({ success: false, message: "Failed to fetch candle data" });
+      return;
+    }
+
 
     // Apply trader type markup if specified
     let markup = 0;
@@ -268,8 +271,8 @@ app.get("/api/candles", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-app.listen(Number(PORT), '0.0.0.0', ()=>{
+app.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`Server is listening on port ${PORT}`);
-  
+
 })
 
